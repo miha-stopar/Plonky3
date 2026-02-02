@@ -20,6 +20,19 @@ use p3_symmetric::{
 use p3_uni_stark::{StarkConfig, prove, verify};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use std::sync::Once;
+
+fn init_tracing() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_test_writer()
+            .try_init();
+    });
+}
 
 /// For testing the public values feature
 pub struct FibonacciAir {}
@@ -227,6 +240,7 @@ fn test_public_value_impl(n: usize, x: u64, log_final_poly_len: usize) {
 
 #[test]
 fn test_zk() {
+    init_tracing();
     type ByteHash = Keccak256Hash;
     let byte_hash = ByteHash {};
 

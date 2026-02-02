@@ -9,7 +9,7 @@ use p3_keccak::{Keccak256Hash, KeccakF};
 use p3_merkle_tree::MerkleTreeHidingMmcs;
 use p3_poseidon2_air::{RoundConstants, VectorizedPoseidon2Air};
 use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
-use p3_uni_stark::{StarkConfig, prove, verify};
+use p3_uni_stark::{StarkConfig, get_symbolic_constraints, prove, verify};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 #[cfg(target_family = "unix")]
@@ -91,6 +91,12 @@ fn main() -> Result<(), impl Debug> {
         PARTIAL_ROUNDS,
         VECTOR_LEN,
     > = VectorizedPoseidon2Air::new(constants);
+
+    let constraints = get_symbolic_constraints::<Val, _>(&air, 0, 0);
+    println!("constraint count = {}", constraints.len());
+    for (i, c) in constraints.iter().enumerate() {
+        println!("{i}: {c:?}");
+    }
 
     let fri_params = create_benchmark_fri_params_zk(challenge_mmcs);
 

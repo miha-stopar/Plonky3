@@ -39,6 +39,7 @@ p3-symmetric = { path = "../symmetric" }
 
 postcard = { workspace = true, features = ["alloc"] }
 rand.workspace = true
+tracing-subscriber = { workspace = true, features = ["std", "env-filter", "fmt"] }
 
 [features]
 parallel = ["p3-maybe-rayon/parallel"]

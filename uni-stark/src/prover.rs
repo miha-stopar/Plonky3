@@ -77,6 +77,11 @@ where
     let symbolic_constraints =
         get_symbolic_constraints(air, preprocessed_width, public_values.len());
 
+    tracing::debug!("constraint count = {}", symbolic_constraints.len());
+    for (i, c) in symbolic_constraints.iter().enumerate() {
+        tracing::debug!("{i}: {c:?}");
+    }
+
     // Count the number of constraints that we have.
     let constraint_count = symbolic_constraints.len();
 
