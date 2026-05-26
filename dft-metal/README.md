@@ -2,7 +2,7 @@
 
 GPU-accelerated BabyBear NTT and fused DFT+Merkle for WHIR on Apple Silicon (Metal).
 
-Ported from [whir-p3-metal](https://github.com/tcoratger/whir-p3-metal); see also the [ethresear.ch write-up](https://ethresear.ch/t/gpu-accelerated-whir-proving-on-apple-silicon/24762).
+Ported from [whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal); see also the [ethresear.ch write-up](https://ethresear.ch/t/gpu-accelerated-whir-proving-on-apple-silicon/24762).
 
 ## Features
 
