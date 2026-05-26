@@ -165,3 +165,77 @@ where
         Ok(())
     }
 }
+
+#[cfg(feature = "gpu-metal")]
+impl<EF, F, Dft, MT, Challenger, L> WhirProver<EF, F, Dft, MT, Challenger, L>
+where
+    F: TwoAdicField + Ord,
+    EF: ExtensionField<F> + TwoAdicField,
+    Dft: TwoAdicSubgroupDft<F>,
+    MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+    Challenger: FieldChallenger<F>
+        + GrindingChallenger<Witness = F>
+        + CanSampleUniformBits<F>
+        + CanObserve<MT::Commitment>,
+    L: Layout<F, EF>,
+{
+    /// Commit using GPU-fused transpose+DFT+Merkle when the MMCS supports it.
+    pub fn commit_fused(
+        &self,
+        witness: <Self as MultilinearPcs<EF, Challenger>>::Witness,
+        challenger: &mut Challenger,
+    ) -> (
+        <Self as MultilinearPcs<EF, Challenger>>::Commitment,
+        <Self as MultilinearPcs<EF, Challenger>>::ProverData,
+    ) {
+        assert_eq!(witness.num_variables(), self.config.num_variables);
+        let (layout, commitment, merkle_data) = L::commit_fused(
+            &self.dft,
+            &self.mmcs,
+            challenger,
+            witness,
+            self.config.folding_factor.at_round(0),
+            self.config.starting_log_inv_rate,
+        );
+        (
+            commitment,
+            WhirProverData {
+                layout,
+                merkle_data,
+                _marker: PhantomData,
+            },
+        )
+    }
+
+    /// Open using GPU-fused DFT+Merkle rounds (pair with [`Self::commit_fused`]).
+    pub fn open_fused(
+        &self,
+        mut prover_data: <Self as MultilinearPcs<EF, Challenger>>::ProverData,
+        protocol: <Self as MultilinearPcs<EF, Challenger>>::OpeningProtocol,
+        challenger: &mut Challenger,
+    ) -> <Self as MultilinearPcs<EF, Challenger>>::Proof {
+        let mut whir_proof = self.config.empty_proof();
+        tracing::info_span!("ood claims").in_scope(|| {
+            whir_proof.initial_ood_answers = (0..self.commitment_ood_samples)
+                .map(|_| prover_data.layout.add_virtual_eval(challenger))
+                .collect::<Vec<_>>();
+        });
+
+        let evals = protocol
+            .iter_openings()
+            .map(|(table_idx, polys)| prover_data.layout.eval(table_idx, polys, challenger))
+            .collect::<Vec<_>>();
+
+        self.prove_fused(
+            &mut whir_proof,
+            challenger,
+            prover_data.layout,
+            prover_data.merkle_data,
+        );
+
+        PcsProof {
+            whir: whir_proof,
+            evals,
+        }
+    }
+}

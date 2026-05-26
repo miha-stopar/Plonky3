@@ -12,8 +12,10 @@ categories.workspace = true
 [features]
 parallel = ["p3-maybe-rayon/parallel"]
 test-util = ["dep:p3-baby-bear"]
+gpu-metal = ["dep:p3-dft-metal"]
 
 [dependencies]
+p3-dft-metal = { workspace = true, optional = true }
 p3-baby-bear = { workspace = true, optional = true }
 p3-challenger.workspace = true
 p3-commit.workspace = true

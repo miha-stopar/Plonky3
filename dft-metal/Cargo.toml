@@ -1,0 +1,39 @@
+[package]
+name = "p3-dft-metal"
+description = "GPU-accelerated BabyBear NTT and fused DFT+Merkle for WHIR (Apple Metal)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# GPU NTT + fused Merkle via embedded Metal shaders (macOS/iOS, Apple GPU).
+gpu-metal = ["dep:metal", "dep:objc", "dep:rayon"]
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+metal = { version = "0.29", optional = true }
+objc = { version = "0.2", optional = true }
+
+[dependencies]
+p3-baby-bear.workspace = true
+p3-challenger.workspace = true
+p3-commit.workspace = true
+p3-dft.workspace = true
+p3-field.workspace = true
+p3-keccak.workspace = true
+p3-matrix.workspace = true
+p3-merkle-tree.workspace = true
+p3-poseidon2.workspace = true
+p3-symmetric.workspace = true
+p3-util.workspace = true
+tracing.workspace = true
+
+rand.workspace = true
+rayon = { workspace = true, optional = true }
+
+[lints]
+workspace = true

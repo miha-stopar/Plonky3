@@ -54,6 +54,31 @@ pub trait Layout<F: TwoAdicField, EF: ExtensionField<F>>: Sized {
         MT: Mmcs<F>,
         Challenger: CanObserve<MT::Commitment>;
 
+    /// Like [`Self::commit`], but uses GPU-fused DFT+Merkle when supported.
+    #[cfg(feature = "gpu-metal")]
+    fn commit_fused<Dft, MT, Challenger>(
+        dft: &Dft,
+        mmcs: &MT,
+        challenger: &mut Challenger,
+        witness: Witness<F>,
+        folding: usize,
+        starting_log_inv_rate: usize,
+    ) -> (Self, MT::Commitment, MT::ProverData<DenseMatrix<F>>)
+    where
+        Dft: TwoAdicSubgroupDft<F>,
+        MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        Self::commit(
+            dft,
+            mmcs,
+            challenger,
+            witness,
+            folding,
+            starting_log_inv_rate,
+        )
+    }
+
     /// Returns the total number of concrete openings recorded so far.
     fn num_claims(&self) -> usize;
 

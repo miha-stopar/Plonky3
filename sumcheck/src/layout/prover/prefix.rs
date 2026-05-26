@@ -12,6 +12,8 @@ use p3_multilinear_util::poly::Poly;
 use p3_multilinear_util::split_eq::SplitEq;
 
 use crate::commit::commit_base;
+#[cfg(feature = "gpu-metal")]
+use crate::commit::commit_base_fused;
 use crate::lagrange::lagrange_weights_01inf_multi;
 use crate::layout::opening::Opening;
 use crate::layout::prover::Layout;
@@ -87,6 +89,33 @@ impl<F: TwoAdicField, EF: ExtensionField<F>> Layout<F, EF> for PrefixProver<F, E
         Challenger: CanObserve<MT::Commitment>,
     {
         let (root, prover_data) = commit_base(
+            Self::variable_order(),
+            dft,
+            mmcs,
+            challenger,
+            &witness.poly,
+            folding,
+            starting_log_inv_rate,
+        );
+
+        (Self::from_witness(witness), root, prover_data)
+    }
+
+    #[cfg(feature = "gpu-metal")]
+    fn commit_fused<Dft, MT, Challenger>(
+        dft: &Dft,
+        mmcs: &MT,
+        challenger: &mut Challenger,
+        witness: Witness<F>,
+        folding: usize,
+        starting_log_inv_rate: usize,
+    ) -> (Self, MT::Commitment, MT::ProverData<DenseMatrix<F>>)
+    where
+        Dft: TwoAdicSubgroupDft<F>,
+        MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+        Challenger: CanObserve<MT::Commitment>,
+    {
+        let (root, prover_data) = commit_base_fused(
             Self::variable_order(),
             dft,
             mmcs,
