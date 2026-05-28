@@ -155,3 +155,12 @@ categories = ["cryptography::cryptocurrencies"]
 [profile.profiling]
 inherits = "release"
 debug = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 1

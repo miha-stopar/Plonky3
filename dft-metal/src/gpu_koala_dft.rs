@@ -1,4 +1,4 @@
-//! GPU-accelerated DFT for BabyBear using **Metal compute only** (embedded MSL).
+//! GPU-accelerated DFT for KoalaBear using **Metal compute only** (embedded MSL).
 //!
 //! Pipeline: Cooley–Tukey radix-2 DIT — bit-reverse permutation, then butterfly stages.
 //! All GPU kernels operate on **row-major** matrices (`data[row * width + col]`),
@@ -16,7 +16,7 @@ use metal::{
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use objc::rc::autoreleasepool;
-use p3_baby_bear::BabyBear;
+use p3_koala_bear::KoalaBear;
 use rayon::prelude::*;
 use p3_dft::{Radix2DFTSmallBatch, TwoAdicSubgroupDft};
 use p3_field::{Field, PrimeCharacteristicRing, TwoAdicField};
@@ -27,133 +27,42 @@ use p3_util::log2_strict_usize;
 use p3_commit::Mmcs;
 use p3_field::BasedVectorSpace;
 
-const SHADER_MSL: &str = include_str!("../shaders/babybear_ntt.metal");
+const SHADER_MSL: &str = include_str!("../shaders/koalabear_ntt.metal");
 
-/// Optional DFT+Merkle fusion for MMCS implementations.
-/// Returns `Ok(commitment, tree)` on success, `Err(mat)` on failure
-/// (returning the unconsumed matrix for fallback).
-pub trait DftCommitFusion<F: Field>: Mmcs<F> {
-    fn dft_and_commit(
-        &self,
-        mat: RowMajorMatrix<F>,
-    ) -> Result<
-        (Self::Commitment, Self::ProverData<RowMajorMatrix<F>>),
-        RowMajorMatrix<F>,
-    > {
-        Err(mat)
-    }
+pub use crate::gpu_dft::DftCommitFusion;
 
-    fn dft_algebra_and_commit<EF>(
-        &self,
-        mat: RowMajorMatrix<EF>,
-    ) -> Result<
-        (
-            Self::Commitment,
-            Self::ProverData<p3_matrix::extension::FlatMatrixView<F, EF, RowMajorMatrix<EF>>>,
-        ),
-        RowMajorMatrix<EF>,
-    >
-    where
-        EF: p3_field::ExtensionField<F> + BasedVectorSpace<F> + Clone + Send + Sync,
-    {
-        Err(mat)
-    }
-
-    /// Fused transpose + pad + DFT + commit for base field.
-    /// Input is a flat slice representing an [in_rows × in_cols] matrix.
-    /// Returns `None` if the implementation doesn't support this operation.
-    fn transpose_pad_dft_and_commit(
-        &self,
-        _data: &[F],
-        _in_rows: usize,
-        _in_cols: usize,
-        _padded_height: usize,
-    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<F>>)> {
-        None
-    }
-
-    /// Compute select-statement weight polynomial on GPU.
-    /// Returns None if GPU acceleration is not available.
-    fn gpu_combine_select_weights(
-        &self,
-        _vars: &[F],
-        _alphas_raw: &[u32],
-        _k: usize,
-    ) -> Option<Vec<u32>> {
-        None
-    }
-
-    /// Fused transpose + pad + DFT + commit for extension field.
-    fn transpose_pad_dft_algebra_and_commit<EF>(
-        &self,
-        _data: &[EF],
-        _in_rows: usize,
-        _in_cols: usize,
-        _padded_height: usize,
-    ) -> Option<(
-        Self::Commitment,
-        Self::ProverData<p3_matrix::extension::FlatMatrixView<F, EF, RowMajorMatrix<EF>>>,
-    )>
-    where
-        EF: p3_field::ExtensionField<F> + BasedVectorSpace<F> + Clone + Send + Sync,
-    {
-        None
-    }
-
-    /// Fused transpose + pad + DFT + commit for extension field, reading from
-    /// packed (NEON SoA) layout directly to avoid the `evals()` unpack.
-    /// `packed_data` is the raw u32 representation of `&[EF::ExtensionPacking]`.
-    /// `num_ef` is the number of EF elements (= packed count * packing width).
-    fn transpose_pad_dft_algebra_and_commit_packed<EF>(
-        &self,
-        _packed_data: &[u32],
-        _num_ef: usize,
-        _in_rows: usize,
-        _in_cols: usize,
-        _padded_height: usize,
-    ) -> Option<(
-        Self::Commitment,
-        Self::ProverData<p3_matrix::extension::FlatMatrixView<F, EF, RowMajorMatrix<EF>>>,
-    )>
-    where
-        EF: p3_field::ExtensionField<F> + BasedVectorSpace<F> + Clone + Send + Sync,
-    {
-        None
-    }
-}
-
-/// Build the Poseidon2 BabyBear width-16 constants buffer (143 Montgomery u32s)
+/// Build the Poseidon2 KoalaBear width-16 constants buffer (143 Montgomery u32s)
 /// by replicating the same RNG sampling as `Poseidon2::new_from_rng_128`.
 /// Layout: [0..64) ext_initial_rc, [64..77) int_rc, [77..141) ext_terminal_rc,
 ///         [141] INV_256, [142] INV_2_27.
 fn build_poseidon2_constants(seed: u64) -> Vec<u32> {
     use rand::{RngExt, SeedableRng, rngs::SmallRng};
 
-    let bb_to_u32 = |bb: BabyBear| -> u32 {
-        unsafe { std::mem::transmute::<BabyBear, u32>(bb) }
+    let bb_to_u32 = |bb: KoalaBear| -> u32 {
+        unsafe { std::mem::transmute::<KoalaBear, u32>(bb) }
     };
 
     let mut rng = SmallRng::seed_from_u64(seed);
     let mut buf = Vec::with_capacity(143);
 
     // Replicate ExternalLayerConstants::new_from_rng(rounds_f=8, rng):
-    // initial_external_constants: 4 × [BabyBear; 16]
+    // initial_external_constants: 4 × [KoalaBear; 16]
     for _ in 0..4 {
-        let round: [BabyBear; 16] = rng.random();
+        let round: [KoalaBear; 16] = rng.random();
         for bb in round { buf.push(bb_to_u32(bb)); }
     }
-    // terminal_external_constants: 4 × [BabyBear; 16]
+    // terminal_external_constants: 4 × [KoalaBear; 16]
     let term_start = buf.len();
     for _ in 0..4 {
-        let round: [BabyBear; 16] = rng.random();
+        let round: [KoalaBear; 16] = rng.random();
         for bb in round { buf.push(bb_to_u32(bb)); }
     }
     let terminal_constants: Vec<u32> = buf[term_start..].to_vec();
     buf.truncate(term_start); // Remove terminal, insert internal first
 
-    // internal_constants: 13 BabyBear values
+    // internal_constants: 13 KoalaBear values
     for _ in 0..13 {
-        let bb: BabyBear = rng.random();
+        let bb: KoalaBear = rng.random();
         buf.push(bb_to_u32(bb));
     }
 
@@ -161,36 +70,36 @@ fn build_poseidon2_constants(seed: u64) -> Vec<u32> {
     buf.extend_from_slice(&terminal_constants);
 
     // INV_256 = (2^8)^{-1} mod p, in Montgomery form
-    buf.push(bb_to_u32(BabyBear::new(256).inverse()));
+    buf.push(bb_to_u32(KoalaBear::new(256).inverse()));
     // INV_2_27 = (2^{27})^{-1} mod p, in Montgomery form
-    buf.push(bb_to_u32(BabyBear::new(1u32 << 27).inverse()));
+    buf.push(bb_to_u32(KoalaBear::new(1u32 << 24).inverse()));
 
     assert_eq!(buf.len(), 143);
     buf
 }
 
 
-/// Precompute twiddle factors in **Montgomery form** (raw `BabyBear` representation).
+/// Precompute twiddle factors in **Montgomery form** (raw `KoalaBear` representation).
 /// The GPU shader uses Montgomery multiplication, so twiddles must be in the same form.
 fn precompute_twiddle_monty(log_n: u32) -> Vec<u32> {
-    let omega = BabyBear::two_adic_generator(log_n as usize);
+    let omega = KoalaBear::two_adic_generator(log_n as usize);
     let half_n = 1usize << (log_n - 1);
-    let mut twiddles: Vec<BabyBear> = Vec::with_capacity(half_n);
-    let mut acc = BabyBear::ONE;
+    let mut twiddles: Vec<KoalaBear> = Vec::with_capacity(half_n);
+    let mut acc = KoalaBear::ONE;
     twiddles.push(acc);
     for _ in 1..half_n {
         acc *= omega;
         twiddles.push(acc);
     }
-    // BabyBear = MontyField31<..> is #[repr(transparent)] over u32.
-    babybear_vec_to_u32(twiddles)
+    // KoalaBear = MontyField31<..> is #[repr(transparent)] over u32.
+    koalabear_vec_to_u32(twiddles)
 }
 
-/// Reinterpret `Vec<BabyBear>` as `Vec<u32>` (zero-cost, same layout).
-fn babybear_vec_to_u32(v: Vec<BabyBear>) -> Vec<u32> {
+/// Reinterpret `Vec<KoalaBear>` as `Vec<u32>` (zero-cost, same layout).
+fn koalabear_vec_to_u32(v: Vec<KoalaBear>) -> Vec<u32> {
     let mut v = std::mem::ManuallyDrop::new(v);
     let (ptr, len, cap) = (v.as_mut_ptr(), v.len(), v.capacity());
-    // SAFETY: BabyBear is #[repr(transparent)] over u32 — identical layout.
+    // SAFETY: KoalaBear is #[repr(transparent)] over u32 — identical layout.
     unsafe { Vec::from_raw_parts(ptr.cast::<u32>(), len, cap) }
 }
 
@@ -270,17 +179,17 @@ unsafe fn fast_memcpy_from_gpu(dst: *mut u8, src: *const u8, len: usize) {
     fast_memcpy(dst, src, len);
 }
 
-/// Metal-backed DFT for BabyBear (macOS).
+/// Metal-backed DFT for KoalaBear (macOS).
 /// Falls back to CPU for small sizes or if the GPU fails.
 ///
 /// Cheap to clone: all Metal resources (device, pipelines, caches) live
 /// behind an `Arc` and are shared across clones.
-pub struct MetalBabyBearDft {
+pub struct MetalKoalaBearDft {
     inner: Arc<MetalInner>,
 }
 
 pub struct MetalInner {
-    cpu: Radix2DFTSmallBatch<BabyBear>,
+    cpu: Radix2DFTSmallBatch<KoalaBear>,
     gpu_min_log_n: u32,
     device: Device,
     queue: metal::CommandQueue,
@@ -347,19 +256,19 @@ struct PowBuffers {
     tg_size: u64,
 }
 
-impl Clone for MetalBabyBearDft {
+impl Clone for MetalKoalaBearDft {
     fn clone(&self) -> Self {
         Self { inner: Arc::clone(&self.inner) }
     }
 }
 
-impl Default for MetalBabyBearDft {
+impl Default for MetalKoalaBearDft {
     fn default() -> Self {
         Self::new_with_params(Radix2DFTSmallBatch::default(), Self::DEFAULT_GPU_MIN_LOG_N, Self::DEFAULT_POSEIDON2_SEED)
     }
 }
 
-impl std::ops::Deref for MetalBabyBearDft {
+impl std::ops::Deref for MetalKoalaBearDft {
     type Target = MetalInner;
     fn deref(&self) -> &MetalInner {
         &self.inner
@@ -383,8 +292,8 @@ struct DualBufferKeepalive {
 }
 
 pub struct GpuMerkleResult {
-    pub cap: p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-    pub digest_layers: Vec<Vec<[BabyBear; 8]>>,
+    pub cap: p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
+    pub digest_layers: Vec<Vec<[KoalaBear; 8]>>,
     pub arity_schedule: Vec<usize>,
     gpu_backed: Option<(usize, Box<dyn std::any::Any + Send + Sync>)>,
     /// When set, the leaf data is zero-copy from this GPU buffer.
@@ -393,7 +302,7 @@ pub struct GpuMerkleResult {
 }
 
 pub struct GpuMerkleResultU64 {
-    pub cap: p3_symmetric::MerkleCap<BabyBear, [u64; 4]>,
+    pub cap: p3_symmetric::MerkleCap<KoalaBear, [u64; 4]>,
     pub digest_layers: Vec<Vec<[u64; 4]>>,
     pub arity_schedule: Vec<usize>,
     gpu_backed: Option<(usize, Box<dyn std::any::Any + Send + Sync>)>,
@@ -405,11 +314,11 @@ impl GpuMerkleResult {
     /// Convert to MerkleTree. Requires `M: 'static` only if leaf_keepalive is set
     /// (zero-copy DFT output path). For the common path, use `into_tree` which
     /// has no `'static` bound.
-    pub fn into_tree<M: p3_matrix::Matrix<BabyBear>>(
+    pub fn into_tree<M: p3_matrix::Matrix<KoalaBear>>(
         self, leaves: Vec<M>,
     ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>,
+        p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
+        p3_merkle_tree::MerkleTree<KoalaBear, KoalaBear, M, 2, 8>,
     ) {
         assert!(self.leaf_keepalive.is_none(), "use into_tree_zc for zero-copy leaves");
         let tree = match self.gpu_backed {
@@ -427,11 +336,11 @@ impl GpuMerkleResult {
     }
 
     /// Zero-copy variant: also prevents the leaf Vecs from being deallocated.
-    pub fn into_tree_zc<M: p3_matrix::Matrix<BabyBear> + Send + Sync + 'static>(
+    pub fn into_tree_zc<M: p3_matrix::Matrix<KoalaBear> + Send + Sync + 'static>(
         self, leaves: Vec<M>,
     ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>,
+        p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
+        p3_merkle_tree::MerkleTree<KoalaBear, KoalaBear, M, 2, 8>,
     ) {
         let tree = match (self.gpu_backed, self.leaf_keepalive) {
             (Some((count, merkle_ka)), Some(dft_buf)) => {
@@ -468,11 +377,11 @@ impl GpuMerkleResult {
 }
 
 impl GpuMerkleResultU64 {
-    pub fn into_tree<M: p3_matrix::Matrix<BabyBear>>(
+    pub fn into_tree<M: p3_matrix::Matrix<KoalaBear>>(
         self, leaves: Vec<M>,
     ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [u64; 4]>,
-        p3_merkle_tree::MerkleTree<BabyBear, u64, M, 2, 4>,
+        p3_symmetric::MerkleCap<KoalaBear, [u64; 4]>,
+        p3_merkle_tree::MerkleTree<KoalaBear, u64, M, 2, 4>,
     ) {
         assert!(
             self.leaf_keepalive.is_none(),
@@ -493,11 +402,11 @@ impl GpuMerkleResultU64 {
     }
 
     /// Zero-copy variant: prevents leaf `Vec` deallocation when DFT output lives in GPU memory.
-    pub fn into_tree_zc<M: p3_matrix::Matrix<BabyBear> + Send + Sync + 'static>(
+    pub fn into_tree_zc<M: p3_matrix::Matrix<KoalaBear> + Send + Sync + 'static>(
         self, leaves: Vec<M>,
     ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [u64; 4]>,
-        p3_merkle_tree::MerkleTree<BabyBear, u64, M, 2, 4>,
+        p3_symmetric::MerkleCap<KoalaBear, [u64; 4]>,
+        p3_merkle_tree::MerkleTree<KoalaBear, u64, M, 2, 4>,
     ) {
         let tree = match (self.gpu_backed, self.leaf_keepalive) {
             (Some((count, merkle_ka)), Some(dft_buf)) => {
@@ -580,7 +489,7 @@ fn keccak_merkle_compress_tg_dispatch_cap() -> u64 {
         .max(1)
 }
 
-impl MetalBabyBearDft {
+impl MetalKoalaBearDft {
     /// Minimum log_n for GPU dispatch. The 8MB total-data threshold (in
     /// try_gpu_dft_inplace) is the primary gate; this only guards against
     /// degenerate cases with very few NTT stages but huge width.
@@ -630,7 +539,7 @@ impl MetalBabyBearDft {
     #[cfg(test)]
     pub fn with_min_log_n(mut self, min_log_n: u32) -> Self {
         Arc::get_mut(&mut self.inner)
-            .expect("cannot modify shared MetalBabyBearDft")
+            .expect("cannot modify shared MetalKoalaBearDft")
             .gpu_min_log_n = min_log_n;
         self
     }
@@ -643,7 +552,7 @@ impl MetalBabyBearDft {
         )
     }
 
-    fn new_with_params(cpu: Radix2DFTSmallBatch<BabyBear>, gpu_min_log_n: u32, poseidon2_seed: u64) -> Self {
+    fn new_with_params(cpu: Radix2DFTSmallBatch<KoalaBear>, gpu_min_log_n: u32, poseidon2_seed: u64) -> Self {
         let device = Device::system_default().expect("Metal device");
         let queue = device.new_command_queue();
         let opts = CompileOptions::new();
@@ -666,32 +575,32 @@ impl MetalBabyBearDft {
                 .unwrap_or_else(|e| panic!("Pipeline {name}: {e}"))
         };
 
-        let bitrev_ps = make_ps("bb_ntt_bitrev");
-        let bitrev_gather_ps = make_ps("bb_bitrev_gather");
-        let dif_r32_oop_ps = make_ps("bb_dif_r32_oop");
-        let dif_r16_oop_ps = make_ps("bb_dif_r16_oop");
-        let butterfly_ps = make_ps("bb_ntt_butterfly");
-        let butterfly_r4_ps = make_ps("bb_ntt_butterfly_r4");
-        let butterfly_r8_ps = make_ps("bb_ntt_butterfly_r8");
-        let shared_mem_ps = make_ps("bb_ntt_shared_mem");
-        let shared_mem_gs_ps = make_ps("bb_ntt_shared_mem_gs");
-        let stockham_ps = make_ps("bb_ntt_stockham");
-        let stockham_gs_ps = make_ps("bb_ntt_stockham_gs");
-        let stockham_global_r2_ps = make_ps("bb_stockham_global_r2");
-        let twiddle_transpose_ps = make_ps("bb_ntt_twiddle_transpose");
-        let dif_r32_ps = make_ps("bb_dif_r32");
-        let dif_r16_ps = make_ps("bb_dif_r16");
-        let dif_r8_ps = make_ps("bb_dif_r8");
-        let dif_r4_ps = make_ps("bb_dif_r4");
-        let dif_r2_ps = make_ps("bb_dif_r2");
-        let dif_r32_bitrev_ps = make_ps("bb_dif_r32_bitrev");
-        let dif_r16_bitrev_ps = make_ps("bb_dif_r16_bitrev");
-        let dif_r8_bitrev_ps = make_ps("bb_dif_r8_bitrev");
-        let dif_r4_bitrev_ps = make_ps("bb_dif_r4_bitrev");
-        let dif_r2_bitrev_ps = make_ps("bb_dif_r2_bitrev");
-        let dif_shared_bitrev_ps = make_ps("bb_dif_shared_bitrev");
-        let dif_shared_bitrev_lg_ps = make_ps("bb_dif_shared_bitrev_lg");
-        let dif_shared_bitrev_xl_ps = make_ps("bb_dif_shared_bitrev_xl");
+        let bitrev_ps = make_ps("kb_ntt_bitrev");
+        let bitrev_gather_ps = make_ps("kb_bitrev_gather");
+        let dif_r32_oop_ps = make_ps("kb_dif_r32_oop");
+        let dif_r16_oop_ps = make_ps("kb_dif_r16_oop");
+        let butterfly_ps = make_ps("kb_ntt_butterfly");
+        let butterfly_r4_ps = make_ps("kb_ntt_butterfly_r4");
+        let butterfly_r8_ps = make_ps("kb_ntt_butterfly_r8");
+        let shared_mem_ps = make_ps("kb_ntt_shared_mem");
+        let shared_mem_gs_ps = make_ps("kb_ntt_shared_mem_gs");
+        let stockham_ps = make_ps("kb_ntt_stockham");
+        let stockham_gs_ps = make_ps("kb_ntt_stockham_gs");
+        let stockham_global_r2_ps = make_ps("kb_stockham_global_r2");
+        let twiddle_transpose_ps = make_ps("kb_ntt_twiddle_transpose");
+        let dif_r32_ps = make_ps("kb_dif_r32");
+        let dif_r16_ps = make_ps("kb_dif_r16");
+        let dif_r8_ps = make_ps("kb_dif_r8");
+        let dif_r4_ps = make_ps("kb_dif_r4");
+        let dif_r2_ps = make_ps("kb_dif_r2");
+        let dif_r32_bitrev_ps = make_ps("kb_dif_r32_bitrev");
+        let dif_r16_bitrev_ps = make_ps("kb_dif_r16_bitrev");
+        let dif_r8_bitrev_ps = make_ps("kb_dif_r8_bitrev");
+        let dif_r4_bitrev_ps = make_ps("kb_dif_r4_bitrev");
+        let dif_r2_bitrev_ps = make_ps("kb_dif_r2_bitrev");
+        let dif_shared_bitrev_ps = make_ps("kb_dif_shared_bitrev");
+        let dif_shared_bitrev_lg_ps = make_ps("kb_dif_shared_bitrev_lg");
+        let dif_shared_bitrev_xl_ps = make_ps("kb_dif_shared_bitrev_xl");
         let poseidon2_hash_leaves_ps = make_ps("poseidon2_hash_leaves");
         let poseidon2_hash_and_compress_ps = make_ps("poseidon2_hash_and_compress");
         let poseidon2_hash4_compress3_ps = make_ps("poseidon2_hash4_compress3");
@@ -703,10 +612,10 @@ impl MetalBabyBearDft {
         let keccak_hash4_compress3_ps = make_ps("keccak_hash4_compress3");
         let keccak_compress_ps = make_ps("keccak_merkle_compress");
         let keccak_compress_two_levels_ps = make_ps("keccak_merkle_compress_two_levels");
-        let combine_select_ps = make_ps("bb_combine_select");
-        let transpose_pad_ps = make_ps("bb_transpose_pad");
-        let transpose_pad_packed_ps = make_ps("bb_transpose_pad_packed");
-        let buf_copy_ps = make_ps("bb_buf_copy");
+        let combine_select_ps = make_ps("kb_combine_select");
+        let transpose_pad_ps = make_ps("kb_transpose_pad");
+        let transpose_pad_packed_ps = make_ps("kb_transpose_pad_packed");
+        let buf_copy_ps = make_ps("kb_buf_copy");
 
         let pow_tg_size = (poseidon2_pow_grind_ps.max_total_threads_per_threadgroup() as u64)
             .min(1024);
@@ -959,16 +868,16 @@ impl MetalBabyBearDft {
 
     /// Transpose an [in_rows × in_cols] matrix of multi-word elements to
     /// [out_height × in_rows] on GPU. Rows beyond in_cols are zero-filled.
-    /// `elem_size` is the number of BabyBear words per logical element
+    /// `elem_size` is the number of KoalaBear words per logical element
     /// (1 for base field, 4 for quartic extension).
     pub fn gpu_transpose_pad(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
-    ) -> RowMajorMatrix<BabyBear> {
+    ) -> RowMajorMatrix<KoalaBear> {
         let out_width_words = in_rows * elem_size;
         let total_out = out_height * out_width_words;
 
@@ -1006,11 +915,11 @@ impl MetalBabyBearDft {
         cb.commit();
         cb.wait_until_completed();
 
-        let mut out: Vec<BabyBear> = Vec::with_capacity(total_out);
+        let mut out: Vec<KoalaBear> = Vec::with_capacity(total_out);
         unsafe {
             out.set_len(total_out);
             std::ptr::copy_nonoverlapping(
-                dst_buf.contents() as *const BabyBear,
+                dst_buf.contents() as *const KoalaBear,
                 out.as_mut_ptr(),
                 total_out,
             );
@@ -1079,7 +988,7 @@ impl MetalBabyBearDft {
 
     /// Run a single Poseidon2 permutation on GPU and return the result (for testing).
     #[cfg(test)]
-    fn gpu_poseidon2_permute(&self, input: &[BabyBear; 16]) -> [BabyBear; 16] {
+    fn gpu_poseidon2_permute(&self, input: &[KoalaBear; 16]) -> [KoalaBear; 16] {
         let opts = MTLResourceOptions::CPUCacheModeDefaultCache | MTLResourceOptions::StorageModeShared;
         let data_buf = self.device.new_buffer_with_data(
             input.as_ptr().cast(),
@@ -1111,10 +1020,10 @@ impl MetalBabyBearDft {
         });
 
         // Read only the first 8 elements (truncated permutation output)
-        let mut result = [BabyBear::ZERO; 16];
+        let mut result = [KoalaBear::ZERO; 16];
         unsafe {
             std::ptr::copy_nonoverlapping(
-                out_buf.contents() as *const BabyBear,
+                out_buf.contents() as *const KoalaBear,
                 result.as_mut_ptr(),
                 8,
             );
@@ -1403,18 +1312,18 @@ impl MetalBabyBearDft {
 
     /// Convert a contiguous GPU Merkle buffer into digest_layers / cap format.
     fn read_merkle_layers(layers: &MerkleLayers) -> (
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        Vec<Vec<[BabyBear; 8]>>,
+        p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
+        Vec<Vec<[KoalaBear; 8]>>,
         Vec<usize>,
     ) {
         let base_ptr = layers.buf.contents() as *const u8;
 
-        let digest_layers: Vec<Vec<[BabyBear; 8]>> = layers.num_digests
+        let digest_layers: Vec<Vec<[KoalaBear; 8]>> = layers.num_digests
             .iter()
             .zip(layers.offsets.iter())
             .map(|(&count, &offset)| {
                 let num_digests = count as usize;
-                let mut digests: Vec<[BabyBear; 8]> = Vec::with_capacity(num_digests);
+                let mut digests: Vec<[KoalaBear; 8]> = Vec::with_capacity(num_digests);
                 unsafe { digests.set_len(num_digests); }
 
                 let byte_len = num_digests * 8 * size_of::<u32>();
@@ -1446,16 +1355,16 @@ impl MetalBabyBearDft {
 
         let root_offset = *layers.offsets.last().unwrap();
         let root_digest = unsafe {
-            *(base_ptr.add(root_offset as usize) as *const [BabyBear; 8])
+            *(base_ptr.add(root_offset as usize) as *const [KoalaBear; 8])
         };
         let cap = p3_symmetric::MerkleCap::new(vec![root_digest]);
 
-        let digest_layers: Vec<Vec<[BabyBear; 8]>> = layers.num_digests
+        let digest_layers: Vec<Vec<[KoalaBear; 8]>> = layers.num_digests
             .iter()
             .zip(layers.offsets.iter())
             .map(|(&count, &offset)| {
                 let n = count as usize;
-                let ptr = unsafe { base_ptr.add(offset as usize) as *mut [BabyBear; 8] };
+                let ptr = unsafe { base_ptr.add(offset as usize) as *mut [KoalaBear; 8] };
                 unsafe { Vec::from_raw_parts(ptr, n, n) }
             })
             .collect();
@@ -1504,7 +1413,7 @@ impl MetalBabyBearDft {
     /// GPU command buffer, avoiding the CPU round-trip between them.
     pub fn gpu_dft_and_merkle(
         &self,
-        values: &mut Vec<BabyBear>,
+        values: &mut Vec<KoalaBear>,
         height: usize,
         width: usize,
     ) -> Option<GpuMerkleResult> {
@@ -1654,7 +1563,7 @@ impl MetalBabyBearDft {
     /// but runs Keccak row hashing + digest compression instead of Poseidon2.
     pub fn gpu_dft_and_keccak_merkle(
         &self,
-        values: &mut Vec<BabyBear>,
+        values: &mut Vec<KoalaBear>,
         height: usize,
         width: usize,
     ) -> Option<GpuMerkleResultU64> {
@@ -1799,12 +1708,12 @@ impl MetalBabyBearDft {
     /// DFT result in `out_values` plus Merkle digest layers.
     pub fn gpu_transpose_dft_and_merkle(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
-    ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
+    ) -> Option<(Vec<KoalaBear>, GpuMerkleResult)> {
         self.gpu_transpose_dft_and_merkle_inner(data.as_ptr(), data.len(), in_rows, in_cols, out_height, elem_size, false)
     }
 
@@ -1812,25 +1721,25 @@ impl MetalBabyBearDft {
     /// Each block of `elem_size * 4` elements stores 4 EF values in SoA form.
     pub fn gpu_transpose_dft_and_merkle_packed(
         &self,
-        data_ptr: *const BabyBear,
+        data_ptr: *const KoalaBear,
         data_len: usize,
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
-    ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
+    ) -> Option<(Vec<KoalaBear>, GpuMerkleResult)> {
         self.gpu_transpose_dft_and_merkle_inner(data_ptr, data_len, in_rows, in_cols, out_height, elem_size, true)
     }
 
     /// Fused GPU transpose+pad → DFT → Keccak Merkle (single command buffer, like Poseidon path).
     pub fn gpu_transpose_dft_and_keccak_merkle(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
-    ) -> Option<(Vec<BabyBear>, GpuMerkleResultU64)> {
+    ) -> Option<(Vec<KoalaBear>, GpuMerkleResultU64)> {
         self.gpu_transpose_dft_and_keccak_merkle_inner(
             data.as_ptr(),
             data.len(),
@@ -1845,13 +1754,13 @@ impl MetalBabyBearDft {
     /// Packed-input variant of [`Self::gpu_transpose_dft_and_keccak_merkle`].
     pub fn gpu_transpose_dft_and_keccak_merkle_packed(
         &self,
-        data_ptr: *const BabyBear,
+        data_ptr: *const KoalaBear,
         data_len: usize,
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
-    ) -> Option<(Vec<BabyBear>, GpuMerkleResultU64)> {
+    ) -> Option<(Vec<KoalaBear>, GpuMerkleResultU64)> {
         self.gpu_transpose_dft_and_keccak_merkle_inner(
             data_ptr,
             data_len,
@@ -1865,14 +1774,14 @@ impl MetalBabyBearDft {
 
     fn gpu_transpose_dft_and_merkle_inner(
         &self,
-        data_ptr: *const BabyBear,
+        data_ptr: *const KoalaBear,
         data_len: usize,
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
         packed_input: bool,
-    ) -> Option<(Vec<BabyBear>, GpuMerkleResult)> {
+    ) -> Option<(Vec<KoalaBear>, GpuMerkleResult)> {
         let out_width = in_rows * elem_size;
         let total_out = out_height * out_width;
         let log_n = log2_strict_usize(out_height) as u32;
@@ -1900,7 +1809,7 @@ impl MetalBabyBearDft {
 
         let profiling = std::env::var("GPU_PROFILE").is_ok();
 
-        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>, Option<bool>)> = autoreleasepool(|| {
+        let gpu_result: Option<(MerkleLayers, Vec<KoalaBear>, Option<bool>)> = autoreleasepool(|| {
             let transpose_ps = if packed_input {
                 &self.transpose_pad_packed_ps
             } else {
@@ -1966,7 +1875,7 @@ impl MetalBabyBearDft {
 
                 // Phase 3: Memcpy
                 let t2 = Instant::now();
-                let mut out_values: Vec<BabyBear> = Vec::with_capacity(total_out);
+                let mut out_values: Vec<KoalaBear> = Vec::with_capacity(total_out);
                 unsafe {
                     out_values.set_len(total_out);
                     fast_memcpy_from_gpu(
@@ -2025,7 +1934,7 @@ impl MetalBabyBearDft {
                 // Zero-copy: create Vec pointing directly to the Metal buffer
                 let out_values = unsafe {
                     Vec::from_raw_parts(
-                        dft_out_buf.contents() as *mut BabyBear,
+                        dft_out_buf.contents() as *mut KoalaBear,
                         total_out,
                         total_out,
                     )
@@ -2063,14 +1972,14 @@ impl MetalBabyBearDft {
 
     fn gpu_transpose_dft_and_keccak_merkle_inner(
         &self,
-        data_ptr: *const BabyBear,
+        data_ptr: *const KoalaBear,
         data_len: usize,
         in_rows: usize,
         in_cols: usize,
         out_height: usize,
         elem_size: usize,
         packed_input: bool,
-    ) -> Option<(Vec<BabyBear>, GpuMerkleResultU64)> {
+    ) -> Option<(Vec<KoalaBear>, GpuMerkleResultU64)> {
         let out_width = in_rows * elem_size;
         let total_out = out_height * out_width;
         let log_n = log2_strict_usize(out_height) as u32;
@@ -2098,7 +2007,7 @@ impl MetalBabyBearDft {
 
         let profiling = std::env::var("GPU_PROFILE").is_ok();
 
-        let gpu_result: Option<(MerkleLayers, Vec<BabyBear>, Option<bool>)> = autoreleasepool(|| {
+        let gpu_result: Option<(MerkleLayers, Vec<KoalaBear>, Option<bool>)> = autoreleasepool(|| {
             let transpose_ps = if packed_input {
                 &self.transpose_pad_packed_ps
             } else {
@@ -2161,7 +2070,7 @@ impl MetalBabyBearDft {
                 let merkle_ms = t1.elapsed().as_secs_f64() * 1000.0;
 
                 let t2 = Instant::now();
-                let mut out_values: Vec<BabyBear> = Vec::with_capacity(total_out);
+                let mut out_values: Vec<KoalaBear> = Vec::with_capacity(total_out);
                 unsafe {
                     out_values.set_len(total_out);
                     fast_memcpy_from_gpu(
@@ -2218,7 +2127,7 @@ impl MetalBabyBearDft {
 
                 let out_values = unsafe {
                     Vec::from_raw_parts(
-                        dft_out_buf.contents() as *mut BabyBear,
+                        dft_out_buf.contents() as *mut KoalaBear,
                         total_out,
                         total_out,
                     )
@@ -2485,10 +2394,10 @@ impl MetalBabyBearDft {
     ///
     /// Returns the result as a flat Vec<u32> of 2^{k-2} packed extension-field
     /// elements (16 u32s each), matching the in-memory layout of
-    /// `PackedBinomialExtensionField<BabyBear, PackedBabyBearNeon, 4>`.
+    /// `PackedBinomialExtensionField<KoalaBear, PackedKoalaBearNeon, 4>`.
     pub fn gpu_combine_select(
         &self,
-        vars: &[BabyBear],
+        vars: &[KoalaBear],
         alphas: &[u32],
         k: usize,
     ) -> Vec<u32> {
@@ -2499,7 +2408,7 @@ impl MetalBabyBearDft {
         let inner = &*self.inner;
 
         // Build k × n power matrix: pow_rows[i][j] = vars[j]^{2^i}
-        let mut pow_rows = vec![vec![BabyBear::ZERO; n]; k];
+        let mut pow_rows = vec![vec![KoalaBear::ZERO; n]; k];
         for (j, var) in vars.iter().enumerate() {
             let mut v = *var;
             for row in &mut pow_rows {
@@ -2514,11 +2423,11 @@ impl MetalBabyBearDft {
         assert!(k_left >= 2);
 
         // Butterfly expansion: produces 2^h × n table from h power rows
-        let butterfly = |rows: &[Vec<BabyBear>]| -> Vec<BabyBear> {
+        let butterfly = |rows: &[Vec<KoalaBear>]| -> Vec<KoalaBear> {
             let h = rows.len();
             let num_rows = 1usize << h;
-            let mut table = vec![BabyBear::ZERO; num_rows * n];
-            table[..n].fill(BabyBear::ONE);
+            let mut table = vec![KoalaBear::ZERO; num_rows * n];
+            table[..n].fill(KoalaBear::ONE);
             for (i, row) in rows.iter().enumerate() {
                 let num_existing = 1usize << i;
                 for b in 0..num_existing {
@@ -2536,7 +2445,7 @@ impl MetalBabyBearDft {
         // Transpose left table from [2^k_left × n] to [n × 2^k_left]
         // for sequential GPU memory access across b_left values.
         let num_left = 1usize << k_left;
-        let mut left_table = vec![BabyBear::ZERO; n * num_left];
+        let mut left_table = vec![KoalaBear::ZERO; n * num_left];
         for row in 0..num_left {
             for col in 0..n {
                 left_table[col * num_left + row] = left_table_rm[row * n + col];
@@ -2612,11 +2521,11 @@ impl MetalBabyBearDft {
         unsafe { std::slice::from_raw_parts(ptr, out_elems) }.to_vec()
     }
 
-    /// Build Merkle digest layers on GPU from a raw BabyBear slice.
+    /// Build Merkle digest layers on GPU from a raw KoalaBear slice.
     /// The slice must contain `height * width` elements in row-major order.
     pub fn gpu_build_merkle_digests_raw(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         height: usize,
         width: usize,
     ) -> GpuMerkleResult {
@@ -2640,11 +2549,11 @@ impl MetalBabyBearDft {
         Self::read_merkle_layers_zero_copy(merkle)
     }
 
-    /// Build Keccak-based Merkle digest layers on GPU from a raw BabyBear slice.
+    /// Build Keccak-based Merkle digest layers on GPU from a raw KoalaBear slice.
     /// The slice must contain `height * width` elements in row-major order.
     pub fn gpu_build_keccak_merkle_digests_raw(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         height: usize,
         width: usize,
     ) -> GpuMerkleResultU64 {
@@ -2671,7 +2580,7 @@ impl MetalBabyBearDft {
     /// Build Keccak-based Merkle digest layers on GPU from a row-major matrix.
     pub fn gpu_build_keccak_merkle_digests(
         &self,
-        mat: &RowMajorMatrix<BabyBear>,
+        mat: &RowMajorMatrix<KoalaBear>,
     ) -> GpuMerkleResultU64 {
         self.gpu_build_keccak_merkle_digests_raw(&mat.values, mat.height(), mat.width())
     }
@@ -2679,7 +2588,7 @@ impl MetalBabyBearDft {
     /// Build Merkle digest layers on GPU from a row-major matrix.
     pub fn gpu_build_merkle_digests(
         &self,
-        mat: &RowMajorMatrix<BabyBear>,
+        mat: &RowMajorMatrix<KoalaBear>,
     ) -> GpuMerkleResult {
         self.gpu_build_merkle_digests_raw(&mat.values, mat.height(), mat.width())
     }
@@ -2688,10 +2597,10 @@ impl MetalBabyBearDft {
     /// Returns `(MerkleCap, MerkleTree)` compatible with plonky3's `MerkleTreeMmcs`.
     pub fn gpu_commit_matrix(
         &self,
-        mat: RowMajorMatrix<BabyBear>,
+        mat: RowMajorMatrix<KoalaBear>,
     ) -> (
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, RowMajorMatrix<BabyBear>, 2, 8>,
+        p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
+        p3_merkle_tree::MerkleTree<KoalaBear, KoalaBear, RowMajorMatrix<KoalaBear>, 2, 8>,
     ) {
         self.gpu_build_merkle_digests(&mat).into_tree(vec![mat])
     }
@@ -2700,7 +2609,7 @@ impl MetalBabyBearDft {
     /// Falls back to `new_buffer_with_data` if alignment requirements aren't met.
     fn make_source_buffer(
         device: &metal::DeviceRef,
-        ptr: *const BabyBear,
+        ptr: *const KoalaBear,
         bytes: u64,
         opts: MTLResourceOptions,
     ) -> Buffer {
@@ -2721,7 +2630,7 @@ impl MetalBabyBearDft {
 
     /// Try to wrap the Vec's memory directly as a Metal buffer (zero-copy).
     /// Requires page-aligned pointer and page-aligned size.
-    fn try_zero_copy_buffer(&self, values: &mut Vec<BabyBear>, total_bytes: u64) -> Option<Buffer> {
+    fn try_zero_copy_buffer(&self, values: &mut Vec<KoalaBear>, total_bytes: u64) -> Option<Buffer> {
         const PAGE_SIZE: usize = 16384;
         let ptr = values.as_mut_ptr() as usize;
         let len = total_bytes as usize;
@@ -2738,7 +2647,7 @@ impl MetalBabyBearDft {
         Some(buf)
     }
 
-    fn try_gpu_dft_inplace(&self, values: &mut Vec<BabyBear>, height: usize, width: usize) -> Option<()> {
+    fn try_gpu_dft_inplace(&self, values: &mut Vec<KoalaBear>, height: usize, width: usize) -> Option<()> {
         let log_n = log2_strict_usize(height) as u32;
         if log_n < self.gpu_min_log_n || log_n > Self::gpu_max_log_n() {
             return None;
@@ -3458,10 +3367,10 @@ impl MetalBabyBearDft {
 
     /// Extract `col_count` columns starting at `col_start` from a row-major matrix.
     fn extract_columns(
-        values: &[BabyBear], height: usize, full_width: usize,
+        values: &[KoalaBear], height: usize, full_width: usize,
         col_start: usize, col_count: usize,
-    ) -> Vec<BabyBear> {
-        let mut out = vec![BabyBear::ZERO; height * col_count];
+    ) -> Vec<KoalaBear> {
+        let mut out = vec![KoalaBear::ZERO; height * col_count];
         out.par_chunks_mut(col_count)
             .enumerate()
             .for_each(|(r, dst)| {
@@ -3473,8 +3382,8 @@ impl MetalBabyBearDft {
 
     /// Merge two column groups back into a full-width row-major matrix.
     fn merge_columns(
-        values: &mut [BabyBear],
-        left: &[BabyBear], right: &[BabyBear],
+        values: &mut [KoalaBear],
+        left: &[KoalaBear], right: &[KoalaBear],
         height: usize, full_width: usize,
         left_width: usize, right_width: usize,
     ) {
@@ -3487,10 +3396,10 @@ impl MetalBabyBearDft {
     }
 }
 
-impl TwoAdicSubgroupDft<BabyBear> for MetalBabyBearDft {
-    type Evaluations = RowMajorMatrix<BabyBear>;
+impl TwoAdicSubgroupDft<KoalaBear> for MetalKoalaBearDft {
+    type Evaluations = RowMajorMatrix<KoalaBear>;
 
-    fn dft_batch(&self, mut mat: RowMajorMatrix<BabyBear>) -> Self::Evaluations {
+    fn dft_batch(&self, mut mat: RowMajorMatrix<KoalaBear>) -> Self::Evaluations {
         let height = mat.height();
         let width = mat.width();
         if self.try_gpu_dft_inplace(&mut mat.values, height, width).is_some() {
@@ -3499,15 +3408,15 @@ impl TwoAdicSubgroupDft<BabyBear> for MetalBabyBearDft {
         self.cpu.dft_batch(mat)
     }
 
-    fn idft_batch(&self, mat: RowMajorMatrix<BabyBear>) -> RowMajorMatrix<BabyBear> {
+    fn idft_batch(&self, mat: RowMajorMatrix<KoalaBear>) -> RowMajorMatrix<KoalaBear> {
         self.cpu.idft_batch(mat)
     }
 
     fn coset_lde_batch(
         &self,
-        mat: RowMajorMatrix<BabyBear>,
+        mat: RowMajorMatrix<KoalaBear>,
         added_bits: usize,
-        shift: BabyBear,
+        shift: KoalaBear,
     ) -> Self::Evaluations {
         // Delegate to the CPU's fused IDFT+DFT which is significantly faster
         // than doing them as separate passes (cache-friendly, single traversal).
@@ -3522,39 +3431,39 @@ use p3_symmetric::{CryptographicHasher, PseudoCompressionFunction};
 
 /// GPU-accelerated MMCS that uses Metal Poseidon2 for Merkle tree construction.
 /// Delegates `open_batch` and `verify_batch` to the inner `MerkleTreeMmcs`.
-pub struct GpuMmcs<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> {
+pub struct GpuKoalaMmcs<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> {
     inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
-    gpu: MetalBabyBearDft,
+    gpu: MetalKoalaBearDft,
 }
 
 /// GPU-accelerated MMCS for Keccak-based Merkle trees (`[u64; 4]` digests).
 ///
-/// Implements [`DftCommitFusion`] like [`GpuMmcs`]: WHIR can use `commit_fused` /
+/// Implements [`DftCommitFusion`] like [`GpuKoalaMmcs`]: WHIR can use `commit_fused` /
 /// `prove_fused` so transpose+pad+NTT and Keccak Merkle run in **one** Metal command
 /// buffer on supported domains (same gating as Poseidon fusion).
-pub struct GpuKeccakMmcs<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> {
+pub struct GpuKoalaKeccakMmcs<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> {
     inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
-    gpu: MetalBabyBearDft,
+    gpu: MetalKoalaBearDft,
 }
 
 impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> std::fmt::Debug
-    for GpuMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+    for GpuKoalaMmcs<P, PW, H, C, N, DIGEST_ELEMS>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuMmcs").finish_non_exhaustive()
+        f.debug_struct("GpuKoalaMmcs").finish_non_exhaustive()
     }
 }
 
 impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize> std::fmt::Debug
-    for GpuKeccakMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+    for GpuKoalaKeccakMmcs<P, PW, H, C, N, DIGEST_ELEMS>
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GpuKeccakMmcs").finish_non_exhaustive()
+        f.debug_struct("GpuKoalaKeccakMmcs").finish_non_exhaustive()
     }
 }
 
 impl<P: Copy, PW: Copy, H: Clone, C: Clone, const N: usize, const DIGEST_ELEMS: usize> Clone
-    for GpuMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+    for GpuKoalaMmcs<P, PW, H, C, N, DIGEST_ELEMS>
 {
     fn clone(&self) -> Self {
         Self {
@@ -3565,7 +3474,7 @@ impl<P: Copy, PW: Copy, H: Clone, C: Clone, const N: usize, const DIGEST_ELEMS: 
 }
 
 impl<P: Copy, PW: Copy, H: Clone, C: Clone, const N: usize, const DIGEST_ELEMS: usize> Clone
-    for GpuKeccakMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+    for GpuKoalaKeccakMmcs<P, PW, H, C, N, DIGEST_ELEMS>
 {
     fn clone(&self) -> Self {
         Self {
@@ -3576,11 +3485,11 @@ impl<P: Copy, PW: Copy, H: Clone, C: Clone, const N: usize, const DIGEST_ELEMS: 
 }
 
 impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
-    GpuMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+    GpuKoalaMmcs<P, PW, H, C, N, DIGEST_ELEMS>
 {
     pub fn new(
         inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
-        gpu: MetalBabyBearDft,
+        gpu: MetalKoalaBearDft,
     ) -> Self {
         Self { inner, gpu }
     }
@@ -3588,26 +3497,26 @@ impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
 }
 
 impl<P, PW, H, C, const N: usize, const DIGEST_ELEMS: usize>
-    GpuKeccakMmcs<P, PW, H, C, N, DIGEST_ELEMS>
+    GpuKoalaKeccakMmcs<P, PW, H, C, N, DIGEST_ELEMS>
 {
     pub fn new(
         inner: MerkleTreeMmcs<P, PW, H, C, N, DIGEST_ELEMS>,
-        gpu: MetalBabyBearDft,
+        gpu: MetalKoalaBearDft,
     ) -> Self {
         Self { inner, gpu }
     }
 }
 
-impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
+impl<P, PW, H, C> GpuKoalaMmcs<P, PW, H, C, 2, 8> {
     /// Fused DFT + Merkle commit in a single GPU command buffer.
     /// Runs NTT, bitrev, Poseidon2 leaf hashing, and all compression layers
     /// without any CPU round-trip between DFT and Merkle.
     pub fn dft_and_commit_matrix(
         &self,
-        mut mat: RowMajorMatrix<BabyBear>,
+        mut mat: RowMajorMatrix<KoalaBear>,
     ) -> Option<(
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
-        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, RowMajorMatrix<BabyBear>, 2, 8>,
+        p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
+        p3_merkle_tree::MerkleTree<KoalaBear, KoalaBear, RowMajorMatrix<KoalaBear>, 2, 8>,
     )> {
         let height = mat.height();
         let width = mat.width();
@@ -3621,17 +3530,17 @@ impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
         &self,
         mat: RowMajorMatrix<EF>,
     ) -> Option<(
-        p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>,
+        p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>,
         p3_merkle_tree::MerkleTree<
-            BabyBear,
-            BabyBear,
-            p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>,
+            KoalaBear,
+            KoalaBear,
+            p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>,
             2,
             8,
         >,
     )>
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let init_width = mat.width();
         let height = mat.height();
@@ -3640,7 +3549,7 @@ impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
 
         let ef_vec = mat.values;
         let (ef_len, ef_cap) = (ef_vec.len(), ef_vec.capacity());
-        let ptr = ef_vec.as_ptr() as *mut BabyBear;
+        let ptr = ef_vec.as_ptr() as *mut KoalaBear;
         std::mem::forget(ef_vec);
         let mut base_values = unsafe { Vec::from_raw_parts(ptr, ef_len * d, ef_cap * d) };
 
@@ -3659,24 +3568,24 @@ impl<P, PW, H, C> GpuMmcs<P, PW, H, C, 2, 8> {
     }
 }
 
-impl<P, PW, H, C> Mmcs<BabyBear> for GpuMmcs<P, PW, H, C, 2, 8>
+impl<P, PW, H, C> Mmcs<KoalaBear> for GpuKoalaMmcs<P, PW, H, C, 2, 8>
 where
-    P: PackedValue<Value = BabyBear>,
-    PW: PackedValue<Value = BabyBear>,
-    H: CryptographicHasher<BabyBear, [BabyBear; 8]>
+    P: PackedValue<Value = KoalaBear>,
+    PW: PackedValue<Value = KoalaBear>,
+    H: CryptographicHasher<KoalaBear, [KoalaBear; 8]>
         + CryptographicHasher<P, [PW; 8]>
         + Sync,
-    C: PseudoCompressionFunction<[BabyBear; 8], 2>
+    C: PseudoCompressionFunction<[KoalaBear; 8], 2>
         + PseudoCompressionFunction<[PW; 8], 2>
         + Sync,
 {
     type ProverData<M> =
-        p3_merkle_tree::MerkleTree<BabyBear, BabyBear, M, 2, 8>;
-    type Commitment = p3_symmetric::MerkleCap<BabyBear, [BabyBear; 8]>;
-    type Proof = Vec<[BabyBear; 8]>;
+        p3_merkle_tree::MerkleTree<KoalaBear, KoalaBear, M, 2, 8>;
+    type Commitment = p3_symmetric::MerkleCap<KoalaBear, [KoalaBear; 8]>;
+    type Proof = Vec<[KoalaBear; 8]>;
     type Error = p3_merkle_tree::MerkleTreeError;
 
-    fn commit<M: p3_matrix::Matrix<BabyBear>>(
+    fn commit<M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         inputs: Vec<M>,
     ) -> (Self::Commitment, Self::ProverData<M>) {
@@ -3704,7 +3613,7 @@ where
                     let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
                     self.gpu.gpu_build_merkle_digests_raw(slice, height, width)
                 } else {
-                    let mut flat = vec![BabyBear::ZERO; height * width];
+                    let mut flat = vec![KoalaBear::ZERO; height * width];
                     flat.par_chunks_mut(width)
                         .enumerate()
                         .for_each(|(r, dst)| {
@@ -3722,23 +3631,23 @@ where
         self.inner.commit(inputs)
     }
 
-    fn commit_matrix<M: p3_matrix::Matrix<BabyBear>>(
+    fn commit_matrix<M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         input: M,
     ) -> (Self::Commitment, Self::ProverData<M>) {
         self.commit(vec![input])
     }
 
-    fn open_batch<M: p3_matrix::Matrix<BabyBear>>(
+    fn open_batch<M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         index: usize,
         prover_data: &Self::ProverData<M>,
-    ) -> BatchOpening<BabyBear, Self> {
+    ) -> BatchOpening<KoalaBear, Self> {
         let inner_opening = self.inner.open_batch(index, prover_data);
         BatchOpening::new(inner_opening.opened_values, inner_opening.opening_proof)
     }
 
-    fn get_matrices<'a, M: p3_matrix::Matrix<BabyBear>>(
+    fn get_matrices<'a, M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         prover_data: &'a Self::ProverData<M>,
     ) -> Vec<&'a M> {
@@ -3750,7 +3659,7 @@ where
         commit: &Self::Commitment,
         dimensions: &[p3_matrix::Dimensions],
         index: usize,
-        batch_opening: BatchOpeningRef<'_, BabyBear, Self>,
+        batch_opening: BatchOpeningRef<'_, KoalaBear, Self>,
     ) -> Result<(), Self::Error> {
         let inner_ref = BatchOpeningRef::new(
             batch_opening.opened_values,
@@ -3760,23 +3669,23 @@ where
     }
 }
 
-impl<P, PW, H, C> Mmcs<BabyBear> for GpuKeccakMmcs<P, PW, H, C, 2, 4>
+impl<P, PW, H, C> Mmcs<KoalaBear> for GpuKoalaKeccakMmcs<P, PW, H, C, 2, 4>
 where
-    P: PackedValue<Value = BabyBear>,
+    P: PackedValue<Value = KoalaBear>,
     PW: PackedValue<Value = u64>,
-    H: CryptographicHasher<BabyBear, [u64; 4]>
+    H: CryptographicHasher<KoalaBear, [u64; 4]>
         + CryptographicHasher<P, [PW; 4]>
         + Sync,
     C: PseudoCompressionFunction<[u64; 4], 2>
         + PseudoCompressionFunction<[PW; 4], 2>
         + Sync,
 {
-    type ProverData<M> = p3_merkle_tree::MerkleTree<BabyBear, u64, M, 2, 4>;
-    type Commitment = p3_symmetric::MerkleCap<BabyBear, [u64; 4]>;
+    type ProverData<M> = p3_merkle_tree::MerkleTree<KoalaBear, u64, M, 2, 4>;
+    type Commitment = p3_symmetric::MerkleCap<KoalaBear, [u64; 4]>;
     type Proof = Vec<[u64; 4]>;
     type Error = p3_merkle_tree::MerkleTreeError;
 
-    fn commit<M: p3_matrix::Matrix<BabyBear>>(
+    fn commit<M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         inputs: Vec<M>,
     ) -> (Self::Commitment, Self::ProverData<M>) {
@@ -3804,7 +3713,7 @@ where
                     let slice = unsafe { std::slice::from_raw_parts(ptr, total) };
                     self.gpu.gpu_build_keccak_merkle_digests_raw(slice, height, width)
                 } else {
-                    let mut flat = vec![BabyBear::ZERO; height * width];
+                    let mut flat = vec![KoalaBear::ZERO; height * width];
                     flat.par_chunks_mut(width).enumerate().for_each(|(r, dst)| {
                         for (i, v) in inputs[0].row(r).unwrap().into_iter().enumerate() {
                             dst[i] = v;
@@ -3820,23 +3729,23 @@ where
         self.inner.commit(inputs)
     }
 
-    fn commit_matrix<M: p3_matrix::Matrix<BabyBear>>(
+    fn commit_matrix<M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         input: M,
     ) -> (Self::Commitment, Self::ProverData<M>) {
         self.commit(vec![input])
     }
 
-    fn open_batch<M: p3_matrix::Matrix<BabyBear>>(
+    fn open_batch<M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         index: usize,
         prover_data: &Self::ProverData<M>,
-    ) -> BatchOpening<BabyBear, Self> {
+    ) -> BatchOpening<KoalaBear, Self> {
         let inner_opening = self.inner.open_batch(index, prover_data);
         BatchOpening::new(inner_opening.opened_values, inner_opening.opening_proof)
     }
 
-    fn get_matrices<'a, M: p3_matrix::Matrix<BabyBear>>(
+    fn get_matrices<'a, M: p3_matrix::Matrix<KoalaBear>>(
         &self,
         prover_data: &'a Self::ProverData<M>,
     ) -> Vec<&'a M> {
@@ -3848,7 +3757,7 @@ where
         commit: &Self::Commitment,
         dimensions: &[p3_matrix::Dimensions],
         index: usize,
-        batch_opening: BatchOpeningRef<'_, BabyBear, Self>,
+        batch_opening: BatchOpeningRef<'_, KoalaBear, Self>,
     ) -> Result<(), Self::Error> {
         let inner_ref = BatchOpeningRef::new(
             batch_opening.opened_values,
@@ -3858,23 +3767,23 @@ where
     }
 }
 
-impl<P, PW, H, C> DftCommitFusion<BabyBear> for GpuMmcs<P, PW, H, C, 2, 8>
+impl<P, PW, H, C> DftCommitFusion<KoalaBear> for GpuKoalaMmcs<P, PW, H, C, 2, 8>
 where
-    P: PackedValue<Value = BabyBear>,
-    PW: PackedValue<Value = BabyBear>,
-    H: CryptographicHasher<BabyBear, [BabyBear; 8]>
+    P: PackedValue<Value = KoalaBear>,
+    PW: PackedValue<Value = KoalaBear>,
+    H: CryptographicHasher<KoalaBear, [KoalaBear; 8]>
         + CryptographicHasher<P, [PW; 8]>
         + Sync,
-    C: PseudoCompressionFunction<[BabyBear; 8], 2>
+    C: PseudoCompressionFunction<[KoalaBear; 8], 2>
         + PseudoCompressionFunction<[PW; 8], 2>
         + Sync,
 {
     fn dft_and_commit(
         &self,
-        mut mat: RowMajorMatrix<BabyBear>,
+        mut mat: RowMajorMatrix<KoalaBear>,
     ) -> Result<
-        (Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>),
-        RowMajorMatrix<BabyBear>,
+        (Self::Commitment, Self::ProverData<RowMajorMatrix<KoalaBear>>),
+        RowMajorMatrix<KoalaBear>,
     > {
         let height = mat.height();
         let width = mat.width();
@@ -3890,12 +3799,12 @@ where
     ) -> Result<
         (
             Self::Commitment,
-            Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+            Self::ProverData<p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>>,
         ),
         RowMajorMatrix<EF>,
     >
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let init_width = mat.width();
         let height = mat.height();
@@ -3904,11 +3813,11 @@ where
 
         let ef_vec = mat.values;
         let (ef_len, ef_cap) = (ef_vec.len(), ef_vec.capacity());
-        let ptr = ef_vec.as_ptr() as *mut BabyBear;
+        let ptr = ef_vec.as_ptr() as *mut KoalaBear;
         std::mem::forget(ef_vec);
         let mut base_values = unsafe { Vec::from_raw_parts(ptr, ef_len * d, ef_cap * d) };
 
-        let reconstitute_ef = |base: Vec<BabyBear>| -> Vec<EF> {
+        let reconstitute_ef = |base: Vec<KoalaBear>| -> Vec<EF> {
             let (len, cap) = (base.len(), base.capacity());
             let p = base.as_ptr() as *mut EF;
             std::mem::forget(base);
@@ -3929,11 +3838,11 @@ where
 
     fn transpose_pad_dft_and_commit(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         in_rows: usize,
         in_cols: usize,
         padded_height: usize,
-    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>)> {
+    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<KoalaBear>>)> {
         let (values, result) =
             self.gpu.gpu_transpose_dft_and_merkle(data, in_rows, in_cols, padded_height, 1)?;
         let mat = RowMajorMatrix::new(values, in_rows);
@@ -3948,13 +3857,13 @@ where
         padded_height: usize,
     ) -> Option<(
         Self::Commitment,
-        Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>>,
     )>
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let d = EF::DIMENSION;
-        let base_data: &[BabyBear] = unsafe {
+        let base_data: &[KoalaBear] = unsafe {
             std::slice::from_raw_parts(data.as_ptr().cast(), data.len() * d)
         };
         let (values, result) =
@@ -3979,10 +3888,10 @@ where
         padded_height: usize,
     ) -> Option<(
         Self::Commitment,
-        Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>>,
     )>
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let d = EF::DIMENSION;
         assert_eq!(packed_data.len(), num_ef * d);
@@ -4004,7 +3913,7 @@ where
 
     fn gpu_combine_select_weights(
         &self,
-        vars: &[BabyBear],
+        vars: &[KoalaBear],
         alphas_raw: &[u32],
         k: usize,
     ) -> Option<Vec<u32>> {
@@ -4012,11 +3921,11 @@ where
     }
 }
 
-impl<P, PW, H, C> DftCommitFusion<BabyBear> for GpuKeccakMmcs<P, PW, H, C, 2, 4>
+impl<P, PW, H, C> DftCommitFusion<KoalaBear> for GpuKoalaKeccakMmcs<P, PW, H, C, 2, 4>
 where
-    P: PackedValue<Value = BabyBear>,
+    P: PackedValue<Value = KoalaBear>,
     PW: PackedValue<Value = u64>,
-    H: CryptographicHasher<BabyBear, [u64; 4]>
+    H: CryptographicHasher<KoalaBear, [u64; 4]>
         + CryptographicHasher<P, [PW; 4]>
         + Sync,
     C: PseudoCompressionFunction<[u64; 4], 2>
@@ -4025,10 +3934,10 @@ where
 {
     fn dft_and_commit(
         &self,
-        mut mat: RowMajorMatrix<BabyBear>,
+        mut mat: RowMajorMatrix<KoalaBear>,
     ) -> Result<
-        (Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>),
-        RowMajorMatrix<BabyBear>,
+        (Self::Commitment, Self::ProverData<RowMajorMatrix<KoalaBear>>),
+        RowMajorMatrix<KoalaBear>,
     > {
         let height = mat.height();
         let width = mat.width();
@@ -4044,12 +3953,12 @@ where
     ) -> Result<
         (
             Self::Commitment,
-            Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+            Self::ProverData<p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>>,
         ),
         RowMajorMatrix<EF>,
     >
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let init_width = mat.width();
         let height = mat.height();
@@ -4058,11 +3967,11 @@ where
 
         let ef_vec = mat.values;
         let (ef_len, ef_cap) = (ef_vec.len(), ef_vec.capacity());
-        let ptr = ef_vec.as_ptr() as *mut BabyBear;
+        let ptr = ef_vec.as_ptr() as *mut KoalaBear;
         std::mem::forget(ef_vec);
         let mut base_values = unsafe { Vec::from_raw_parts(ptr, ef_len * d, ef_cap * d) };
 
-        let reconstitute_ef = |base: Vec<BabyBear>| -> Vec<EF> {
+        let reconstitute_ef = |base: Vec<KoalaBear>| -> Vec<EF> {
             let (len, cap) = (base.len(), base.capacity());
             let p = base.as_ptr() as *mut EF;
             std::mem::forget(base);
@@ -4081,11 +3990,11 @@ where
 
     fn transpose_pad_dft_and_commit(
         &self,
-        data: &[BabyBear],
+        data: &[KoalaBear],
         in_rows: usize,
         in_cols: usize,
         padded_height: usize,
-    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<BabyBear>>)> {
+    ) -> Option<(Self::Commitment, Self::ProverData<RowMajorMatrix<KoalaBear>>)> {
         let (values, result) = self.gpu.gpu_transpose_dft_and_keccak_merkle(
             data, in_rows, in_cols, padded_height, 1,
         )?;
@@ -4101,13 +4010,13 @@ where
         padded_height: usize,
     ) -> Option<(
         Self::Commitment,
-        Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>>,
     )>
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let d = EF::DIMENSION;
-        let base_data: &[BabyBear] = unsafe {
+        let base_data: &[KoalaBear] = unsafe {
             std::slice::from_raw_parts(data.as_ptr().cast(), data.len() * d)
         };
         let (values, result) = self.gpu.gpu_transpose_dft_and_keccak_merkle(
@@ -4133,10 +4042,10 @@ where
         padded_height: usize,
     ) -> Option<(
         Self::Commitment,
-        Self::ProverData<p3_matrix::extension::FlatMatrixView<BabyBear, EF, RowMajorMatrix<EF>>>,
+        Self::ProverData<p3_matrix::extension::FlatMatrixView<KoalaBear, EF, RowMajorMatrix<EF>>>,
     )>
     where
-        EF: p3_field::ExtensionField<BabyBear> + BasedVectorSpace<BabyBear> + Clone + Send + Sync,
+        EF: p3_field::ExtensionField<KoalaBear> + BasedVectorSpace<KoalaBear> + Clone + Send + Sync,
     {
         let d = EF::DIMENSION;
         assert_eq!(packed_data.len(), num_ef * d);
@@ -4161,7 +4070,7 @@ where
 
     fn gpu_combine_select_weights(
         &self,
-        vars: &[BabyBear],
+        vars: &[KoalaBear],
         alphas_raw: &[u32],
         k: usize,
     ) -> Option<Vec<u32>> {
@@ -4170,688 +4079,15 @@ where
 }
 
 /// No-op fusion for CPU-only MerkleTreeMmcs.
-impl<P, PW, H, C> DftCommitFusion<BabyBear> for MerkleTreeMmcs<P, PW, H, C, 2, 8>
+impl<P, PW, H, C> DftCommitFusion<KoalaBear> for MerkleTreeMmcs<P, PW, H, C, 2, 8>
 where
-    P: PackedValue<Value = BabyBear>,
-    PW: PackedValue<Value = BabyBear>,
-    H: CryptographicHasher<BabyBear, [BabyBear; 8]>
+    P: PackedValue<Value = KoalaBear>,
+    PW: PackedValue<Value = KoalaBear>,
+    H: CryptographicHasher<KoalaBear, [KoalaBear; 8]>
         + CryptographicHasher<P, [PW; 8]>
         + Sync,
-    C: PseudoCompressionFunction<[BabyBear; 8], 2>
+    C: PseudoCompressionFunction<[KoalaBear; 8], 2>
         + PseudoCompressionFunction<[PW; 8], 2>
         + Sync,
 {}
 
-// ═══════════════════════════════════════════════════════════════════════
-// GpuChallenger: DuplexChallenger wrapper with GPU-accelerated PoW grinding
-// ═══════════════════════════════════════════════════════════════════════
-
-use p3_baby_bear::Poseidon2BabyBear;
-use p3_challenger::{
-    CanObserve, CanSample, CanSampleBits, CanSampleUniformBits, DuplexChallenger, FieldChallenger,
-    GrindingChallenger, ResamplingError,
-};
-use p3_field::PrimeField64;
-use p3_symmetric::{Hash, MerkleCap, Permutation};
-
-type InnerChallenger = DuplexChallenger<BabyBear, Poseidon2BabyBear<16>, 16, 8>;
-
-/// Rayon+SIMD CPU PoW grind with cancellation support.
-///
-/// Reimplements `DuplexChallenger::grind` logic with an `AtomicBool` that is
-/// checked before each batch to allow early termination when the GPU thread
-/// finds a witness first.
-fn cpu_pow_grind_cancellable(
-    perm: &Poseidon2BabyBear<16>,
-    sponge_state: &[BabyBear; 16],
-    input_buffer: &[BabyBear],
-    bits: usize,
-    cancelled: &AtomicBool,
-) -> Option<BabyBear> {
-    type F = BabyBear;
-    type PackedF = <F as Field>::Packing;
-    const WIDTH: usize = 16;
-    const RATE: usize = 8;
-
-    let lanes = PackedF::WIDTH;
-    let num_batches = F::ORDER_U64.div_ceil(lanes as u64);
-    let order = F::ORDER_U64;
-    let mask = (1u64 << bits) - 1;
-    let witness_idx = input_buffer.len();
-
-    let base_packed_state: [PackedF; WIDTH] = core::array::from_fn(|i| {
-        if i < input_buffer.len() {
-            PackedF::from(input_buffer[i])
-        } else {
-            PackedF::from(sponge_state[i])
-        }
-    });
-
-    (0..num_batches)
-        .into_par_iter()
-        .find_map_any(|batch| {
-            if cancelled.load(Ordering::Relaxed) {
-                return None;
-            }
-            let base = batch * lanes as u64;
-            let mut packed_state = base_packed_state;
-            let packed_witnesses = PackedF::from_fn(|lane| {
-                let candidate = base + lane as u64;
-                if candidate < order {
-                    BabyBear::new(candidate as u32)
-                } else {
-                    BabyBear::NEG_ONE
-                }
-            });
-            packed_state[witness_idx] = packed_witnesses;
-            perm.permute_mut(&mut packed_state);
-            packed_state[RATE - 1]
-                .as_slice()
-                .iter()
-                .zip(packed_witnesses.as_slice())
-                .find(|(sample, _)| (sample.as_canonical_u64() & mask) == 0)
-                .map(|(_, &witness)| witness)
-        })
-}
-
-/// A `DuplexChallenger` wrapper that offloads proof-of-work grinding to GPU.
-///
-/// All other challenger operations (observe, sample, etc.) delegate to the
-/// inner `DuplexChallenger`. The `grind` call runs CPU (rayon+SIMD) and GPU
-/// concurrently, returning whichever finds a witness first.
-#[derive(Clone)]
-pub struct GpuChallenger {
-    pub inner: InnerChallenger,
-    dft: MetalBabyBearDft,
-}
-
-impl GpuChallenger {
-    pub fn new(perm: Poseidon2BabyBear<16>, dft: MetalBabyBearDft) -> Self {
-        Self {
-            inner: InnerChallenger::new(perm),
-            dft,
-        }
-    }
-}
-
-impl CanObserve<BabyBear> for GpuChallenger {
-    fn observe(&mut self, value: BabyBear) {
-        self.inner.observe(value);
-    }
-    fn observe_slice(&mut self, values: &[BabyBear]) {
-        self.inner.observe_slice(values);
-    }
-}
-
-impl<const N: usize> CanObserve<[BabyBear; N]> for GpuChallenger {
-    fn observe(&mut self, values: [BabyBear; N]) {
-        self.inner.observe(values);
-    }
-}
-
-impl<const N: usize> CanObserve<Hash<BabyBear, BabyBear, N>> for GpuChallenger {
-    fn observe(&mut self, values: Hash<BabyBear, BabyBear, N>) {
-        self.inner.observe(values);
-    }
-}
-
-impl CanObserve<Vec<Vec<BabyBear>>> for GpuChallenger {
-    fn observe(&mut self, values: Vec<Vec<BabyBear>>) {
-        self.inner.observe(values);
-    }
-}
-
-impl<const N: usize> CanObserve<MerkleCap<BabyBear, [BabyBear; N]>> for GpuChallenger {
-    fn observe(&mut self, values: MerkleCap<BabyBear, [BabyBear; N]>) {
-        self.inner.observe(values);
-    }
-}
-
-impl<const N: usize> CanObserve<&MerkleCap<BabyBear, [BabyBear; N]>> for GpuChallenger {
-    fn observe(&mut self, values: &MerkleCap<BabyBear, [BabyBear; N]>) {
-        self.inner.observe(values);
-    }
-}
-
-impl<EF> CanSample<EF> for GpuChallenger
-where
-    EF: BasedVectorSpace<BabyBear>,
-{
-    fn sample(&mut self) -> EF {
-        self.inner.sample()
-    }
-}
-
-impl CanSampleBits<usize> for GpuChallenger {
-    fn sample_bits(&mut self, bits: usize) -> usize {
-        self.inner.sample_bits(bits)
-    }
-}
-
-impl CanSampleUniformBits<BabyBear> for GpuChallenger {
-    fn sample_uniform_bits<const RESAMPLE: bool>(
-        &mut self,
-        bits: usize,
-    ) -> Result<usize, ResamplingError> {
-        self.inner.sample_uniform_bits::<RESAMPLE>(bits)
-    }
-}
-
-impl FieldChallenger<BabyBear> for GpuChallenger {}
-
-impl GrindingChallenger for GpuChallenger {
-    type Witness = BabyBear;
-
-    #[tracing::instrument(name = "grind for proof-of-work witness", skip_all)]
-    fn grind(&mut self, bits: usize) -> BabyBear {
-        if bits == 0 {
-            return BabyBear::ZERO;
-        }
-
-        // For low difficulty, CPU rayon+SIMD is faster than GPU dispatch overhead.
-        // GPU Metal dispatch costs ~100μs; CPU solves 2^bits trials in ~2^bits/40*100ns.
-        // Breakeven around bits=20, so below that we skip the GPU entirely.
-        // With DEFAULT_MAX_POW=16, this means CPU-only grind for standard configs.
-        if bits < 20 {
-            return self.inner.grind(bits);
-        }
-
-        // Build the GPU grind state (Montgomery-form u32 array).
-        let witness_idx = self.inner.input_buffer.len();
-        let mut base_state_monty = [0u32; 16];
-        for i in 0..16 {
-            let val = if i < self.inner.input_buffer.len() {
-                self.inner.input_buffer[i]
-            } else {
-                self.inner.sponge_state[i]
-            };
-            base_state_monty[i] = unsafe { std::mem::transmute::<BabyBear, u32>(val) };
-        }
-
-        // Run CPU (rayon+SIMD) and GPU Metal concurrently.
-        // GPU grind stays on the main thread (Metal objects aren't Send).
-        // CPU grind runs on a spawned thread using rayon's thread pool.
-        let cancelled = AtomicBool::new(false);
-        let perm = &self.inner.permutation;
-        let sponge_state = &self.inner.sponge_state;
-        let input_buffer: &[BabyBear] = &self.inner.input_buffer;
-        let dft = &self.dft;
-
-        let witness = std::thread::scope(|s| {
-            let cpu_handle = s.spawn(|| {
-                cpu_pow_grind_cancellable(
-                    perm,
-                    sponge_state,
-                    input_buffer,
-                    bits,
-                    &cancelled,
-                )
-            });
-
-            // GPU grind on main thread (has Metal device access)
-            let gpu_result = dft.gpu_pow_grind_cancellable(
-                &base_state_monty,
-                witness_idx as u32,
-                bits as u32,
-                &cancelled,
-            );
-
-            if let Some(gpu_nonce) = gpu_result {
-                // GPU found it — signal CPU and return
-                cancelled.store(true, Ordering::Relaxed);
-                let _ = cpu_handle.join();
-                BabyBear::new(gpu_nonce)
-            } else {
-                // GPU was cancelled or exhausted — CPU must have found it
-                let cpu_result = cpu_handle.join().unwrap();
-                cpu_result.expect("Neither CPU nor GPU found PoW witness")
-            }
-        });
-
-        assert!(
-            self.inner.check_witness(bits, witness),
-            "concurrent PoW witness failed verification"
-        );
-        witness
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rand::{RngExt, SeedableRng, rngs::SmallRng};
-
-    use super::*;
-
-    /// Measure raw GPU memory bandwidth and per-phase NTT timings.
-    #[test]
-    fn gpu_bandwidth_and_phase_timing() {
-        for &(test_log_n, test_width) in &[(20u32, 64usize), (22, 64)] {
-            run_timing_test(test_log_n, test_width);
-        }
-    }
-
-    fn run_timing_test(log_n: u32, width: usize) {
-        let gpu = MetalBabyBearDft::default();
-        let n = 1usize << log_n;
-        let total = n * width;
-        let total_bytes = (total * 4) as u64;
-        let data_gb = total_bytes as f64 / 1e9;
-
-        let opts = MTLResourceOptions::CPUCacheModeDefaultCache
-            | MTLResourceOptions::StorageModeShared;
-        let buf_a = gpu.device.new_buffer(total_bytes, opts);
-        let buf_b = gpu.device.new_buffer(total_bytes, opts);
-        let tw = gpu.twiddle_buffer(log_n);
-
-        let bw_ps = {
-            let lib = gpu.device.new_library_with_source(SHADER_MSL, &CompileOptions::new()).unwrap();
-            let f = lib.get_function("bb_bandwidth_test", None).unwrap();
-            gpu.device.new_compute_pipeline_state_with_function(&f).unwrap()
-        };
-
-        let time_cmd = |label: &str, encode: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
-            // Warmup
-            autoreleasepool(|| {
-                let cmd = gpu.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
-                encode(&enc);
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-            });
-            // Timed runs
-            let iters = 5;
-            let start = std::time::Instant::now();
-            for _ in 0..iters {
-                autoreleasepool(|| {
-                    let cmd = gpu.queue.new_command_buffer();
-                    let enc = cmd.new_compute_command_encoder();
-                    encode(&enc);
-                    enc.end_encoding();
-                    cmd.commit();
-                    cmd.wait_until_completed();
-                });
-            }
-            let elapsed = start.elapsed().as_secs_f64() / iters as f64;
-            let bw = (2.0 * data_gb) / elapsed; // read + write
-            eprintln!("  {label:30}: {:.2} ms  ({:.1} GB/s)", elapsed * 1e3, bw);
-            elapsed
-        };
-
-        let height = n as u32;
-        let set_u32 = |enc: &metal::ComputeCommandEncoderRef, index: u64, val: u32| {
-            enc.set_bytes(index, size_of::<u32>() as u64, (&val as *const u32).cast());
-        };
-
-        eprintln!("\n=== GPU Bandwidth & Phase Timing (log_n={log_n}, width={width}, {:.2} GB) ===", data_gb);
-
-        // 1) Raw bandwidth: read + write every element
-        time_cmd("raw_bandwidth (r+w)", &|enc| {
-            enc.set_compute_pipeline_state(&bw_ps);
-            enc.set_buffer(0, Some(&buf_a), 0);
-            let max_tg = bw_ps.max_total_threads_per_threadgroup() as u64;
-            enc.dispatch_threads(
-                MTLSize { width: total as u64, height: 1, depth: 1 },
-                MTLSize { width: max_tg, height: 1, depth: 1 },
-            );
-        });
-
-        // 2) Bitrev pass
-        time_cmd("bitrev", &|enc| {
-            enc.set_compute_pipeline_state(&gpu.bitrev_ps);
-            enc.set_buffer(0, Some(&buf_a), 0);
-            set_u32(enc, 1, height);
-            set_u32(enc, 2, width as u32);
-            set_u32(enc, 3, log_n);
-            let tg_w = (width as u32).min(32);
-            let tg_h = (gpu.bitrev_ps.max_total_threads_per_threadgroup() as u32 / tg_w).min(height);
-            enc.dispatch_threads(
-                MTLSize { width: width as u64, height: height as u64, depth: 1 },
-                MTLSize { width: tg_w as u64, height: tg_h as u64, depth: 1 },
-            );
-        });
-
-        // 3) Shared-mem pass (10 stages fused)
-        let log_block = gpu.effective_log_block(log_n);
-        time_cmd(&format!("shared_mem ({log_block} stages)"), &|enc| {
-            gpu.dispatch_shared_mem(enc, &buf_a, &tw, height, width as u32, log_block, 0);
-        });
-
-        // 4) One R8 dispatch
-        time_cmd("single_R8 (3 stages)", &|enc| {
-            let tg_w = (width as u32).min(32);
-            let num_units = height >> 3;
-            let max_tg = gpu.butterfly_r8_ps.max_total_threads_per_threadgroup() as u32;
-            enc.set_compute_pipeline_state(&gpu.butterfly_r8_ps);
-            enc.set_buffer(0, Some(&buf_a), 0);
-            enc.set_buffer(1, Some(&tw), 0);
-            set_u32(enc, 2, height);
-            set_u32(enc, 3, width as u32);
-            set_u32(enc, 4, log_block); // stage = log_block
-            enc.dispatch_threads(
-                MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                MTLSize { width: tg_w as u64, height: (max_tg / tg_w).min(num_units) as u64, depth: 1 },
-            );
-        });
-
-        // 5) Stockham radix-4 (12 stages fused)
-        let stockham_log_block = gpu.max_log_stockham_block.min(log_n);
-        time_cmd(&format!("stockham_r4 ({stockham_log_block} stages)"), &|enc| {
-            gpu.dispatch_stockham(enc, &buf_a, &tw, height, width as u32, stockham_log_block);
-        });
-
-        // 6) Full classic NTT (all phases combined)
-        time_cmd("full_classic_NTT", &|enc| {
-            gpu.encode_classic_ntt(enc, &buf_a, &tw, log_n, height, width as u32);
-        });
-
-        // 7) DIF NTT (no bitrev, no shared-mem, fused bitrev at end)
-        time_cmd("dif_ntt (fused bitrev)", &|enc| {
-            gpu.encode_dif_ntt(enc, &buf_a, &buf_b, &tw, log_n, height, width as u32);
-        });
-
-        // 8) Single DIF R8 dispatch
-        let tg_w2 = (width as u32).min(32);
-        time_cmd("single_DIF_R8 (3 stages)", &|enc| {
-            let num_units = height >> 3;
-            let max_tg = gpu.dif_r8_ps.max_total_threads_per_threadgroup() as u32;
-            enc.set_compute_pipeline_state(&gpu.dif_r8_ps);
-            enc.set_buffer(0, Some(&buf_a), 0);
-            enc.set_buffer(1, Some(&tw), 0);
-            set_u32(enc, 2, height);
-            set_u32(enc, 3, width as u32);
-            set_u32(enc, 4, 0u32);
-            enc.dispatch_threads(
-                MTLSize { width: width as u64, height: num_units as u64, depth: 1 },
-                MTLSize {
-                    width: tg_w2 as u64,
-                    height: (max_tg / tg_w2).min(num_units) as u64,
-                    depth: 1,
-                },
-            );
-        });
-
-        eprintln!("===\n");
-    }
-
-    /// Simulate the full benchmark flow with per-phase timing.
-    #[test]
-    fn gpu_full_flow_timing() {
-        let gpu = MetalBabyBearDft::default();
-        for &(log_n, width) in &[(20u32, 64usize), (22, 64)] {
-            let n = 1usize << log_n;
-            let total = n * width;
-            let total_bytes = (total * 4) as u64;
-            let data_gb = total_bytes as f64 / 1e9;
-
-            let opts = MTLResourceOptions::CPUCacheModeDefaultCache
-                | MTLResourceOptions::StorageModeShared;
-            let buf_a = gpu.device.new_buffer(total_bytes, opts);
-            let buf_b = gpu.device.new_buffer(total_bytes, opts);
-            let tw = gpu.twiddle_buffer(log_n);
-            let height = n as u32;
-
-            let iters = if log_n <= 20 { 5 } else { 2 };
-
-            // Warmup
-            autoreleasepool(|| {
-                let cmd = gpu.queue.new_command_buffer();
-                let enc = cmd.new_compute_command_encoder();
-                gpu.encode_dif_ntt(&enc, &buf_a, &buf_b, &tw, log_n, height, width as u32);
-                enc.end_encoding();
-                cmd.commit();
-                cmd.wait_until_completed();
-            });
-
-            // Pure GPU compute (no memcpy)
-            let start = std::time::Instant::now();
-            for _ in 0..iters {
-                autoreleasepool(|| {
-                    let cmd = gpu.queue.new_command_buffer();
-                    let enc = cmd.new_compute_command_encoder();
-                    gpu.encode_dif_ntt(&enc, &buf_a, &buf_b, &tw, log_n, height, width as u32);
-                    enc.end_encoding();
-                    cmd.commit();
-                    cmd.wait_until_completed();
-                });
-            }
-            let gpu_ms = start.elapsed().as_secs_f64() / iters as f64 * 1e3;
-
-            // Memcpy timing
-            let mut rng = SmallRng::seed_from_u64(42);
-            let values: Vec<BabyBear> = (0..total).map(|_| rng.random()).collect();
-            let copy_start = std::time::Instant::now();
-            for _ in 0..iters {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        values.as_ptr().cast::<u8>(),
-                        buf_a.contents() as *mut u8,
-                        total_bytes as usize,
-                    );
-                }
-            }
-            let copy_in_ms = copy_start.elapsed().as_secs_f64() / iters as f64 * 1e3;
-
-            let mut out: Vec<BabyBear> = vec![BabyBear::ZERO; total];
-            let copy_start = std::time::Instant::now();
-            for _ in 0..iters {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        buf_b.contents() as *const BabyBear,
-                        out.as_mut_ptr(),
-                        total,
-                    );
-                }
-            }
-            let copy_out_ms = copy_start.elapsed().as_secs_f64() / iters as f64 * 1e3;
-
-            // Full flow (clone + memcpy_in + gpu + memcpy_out)
-            let full_start = std::time::Instant::now();
-            for _ in 0..iters {
-                let mut v = values.clone();
-                gpu.try_gpu_dft_inplace(&mut v, n, width);
-            }
-            let full_ms = full_start.elapsed().as_secs_f64() / iters as f64 * 1e3;
-
-            eprintln!("[{log_n}x{width} ({data_gb:.2}GB)] gpu_pure={gpu_ms:.1}ms copy_in={copy_in_ms:.1}ms copy_out={copy_out_ms:.1}ms full_flow={full_ms:.1}ms overhead={:.1}ms",
-                full_ms - gpu_ms);
-        }
-    }
-
-    #[test]
-    fn metal_dft_matches_cpu() {
-        let mut rng = SmallRng::seed_from_u64(42);
-        let cpu_dft = Radix2DFTSmallBatch::<BabyBear>::default();
-        let gpu_dft = MetalBabyBearDft::default().with_min_log_n(14);
-
-        for log_n in 2..=20 {
-            let n = 1usize << log_n;
-            for &width in &[16, 32, 64] {
-                let values: Vec<BabyBear> = (0..n * width).map(|_| rng.random()).collect();
-                let cpu_result =
-                    cpu_dft.dft_batch(RowMajorMatrix::new(values.clone(), width));
-                let gpu_result = gpu_dft.dft_batch(RowMajorMatrix::new(values, width));
-                if cpu_result.values != gpu_result.values {
-                    let first_diff = cpu_result.values.iter().zip(&gpu_result.values)
-                        .enumerate()
-                        .find(|(_, (a, b))| a != b);
-                    if let Some((idx, (cpu_v, gpu_v))) = first_diff {
-                        eprintln!("mismatch at log_n={log_n} w={width}: idx={idx} cpu={cpu_v:?} gpu={gpu_v:?}");
-                    }
-                    panic!("mismatch at log_n={log_n}, width={width}");
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn metal_poseidon2_matches_cpu() {
-        use p3_baby_bear::Poseidon2BabyBear;
-        use p3_symmetric::Permutation;
-
-        let gpu = MetalBabyBearDft::default(); // uses seed 1
-
-        // Create CPU permutation with the same seed
-        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(
-            &mut SmallRng::seed_from_u64(1),
-        );
-
-        let input: [BabyBear; 16] = BabyBear::new_array([
-            894848333, 1437655012, 1200606629, 1690012884, 71131202, 1749206695, 1717947831,
-            120589055, 19776022, 42382981, 1831865506, 724844064, 171220207, 1299207443, 227047920,
-            1783754913,
-        ]);
-
-        // CPU reference
-        let mut expected = input;
-        perm.permute_mut(&mut expected);
-
-        // GPU compress: input[0..8] = left, input[8..16] = right → output first 8 of permute(input)
-        let gpu_result = gpu.gpu_poseidon2_permute(&input);
-
-        for i in 0..8 {
-            assert_eq!(
-                gpu_result[i], expected[i],
-                "Poseidon2 mismatch at index {i}: gpu={:?} expected={:?}",
-                gpu_result[i], expected[i]
-            );
-        }
-        eprintln!("GPU Poseidon2 matches CPU reference (first 8 elements)!");
-    }
-
-    #[test]
-    fn metal_poseidon2_leaf_hash_matches_cpu() {
-        use p3_baby_bear::Poseidon2BabyBear;
-        use p3_symmetric::PaddingFreeSponge;
-        use p3_symmetric::CryptographicHasher;
-
-        let gpu = MetalBabyBearDft::default();
-        let mut rng = SmallRng::seed_from_u64(123);
-
-        // Create CPU hasher (same config as benchmark)
-        let perm = Poseidon2BabyBear::<16>::new_from_rng_128(&mut SmallRng::seed_from_u64(1));
-        let hasher = PaddingFreeSponge::<Poseidon2BabyBear<16>, 16, 8, 8>::new(perm);
-
-        // Test with various leaf widths
-        for leaf_width in [8, 16, 32, 64] {
-            let num_leaves = 64u32;
-            let data: Vec<BabyBear> = (0..(num_leaves as usize * leaf_width))
-                .map(|_| rng.random())
-                .collect();
-
-            // CPU hash
-            let cpu_digests: Vec<[BabyBear; 8]> = (0..num_leaves as usize)
-                .map(|i| {
-                    let row = &data[i * leaf_width..(i + 1) * leaf_width];
-                    hasher.hash_iter(row.iter().copied())
-                })
-                .collect();
-
-            // GPU hash
-            let opts = MTLResourceOptions::CPUCacheModeDefaultCache
-                | MTLResourceOptions::StorageModeShared;
-            let data_buf = gpu.device.new_buffer_with_data(
-                data.as_ptr().cast(),
-                (data.len() * size_of::<u32>()) as u64,
-                opts,
-            );
-            let layers = gpu.gpu_merkle_tree(&data_buf, num_leaves, leaf_width as u32);
-            let gpu_leaf_u32 = &layers[0];
-
-            // Compare
-            for i in 0..num_leaves as usize {
-                for j in 0..8 {
-                    let cpu_val: u32 = unsafe { std::mem::transmute(cpu_digests[i][j]) };
-                    let gpu_val = gpu_leaf_u32[i * 8 + j];
-                    assert_eq!(
-                        cpu_val, gpu_val,
-                        "Leaf hash mismatch: leaf={i} elem={j} width={leaf_width} cpu={cpu_val:#x} gpu={gpu_val:#x}"
-                    );
-                }
-            }
-            eprintln!("Leaf hash matches CPU for width={leaf_width}, {num_leaves} leaves");
-        }
-    }
-
-    #[test]
-    fn metal_dft_algebra_batch_matches_cpu() {
-        use p3_field::extension::BinomialExtensionField;
-        type EF = BinomialExtensionField<BabyBear, 4>;
-
-        let mut rng = SmallRng::seed_from_u64(99);
-        let cpu_dft = Radix2DFTSmallBatch::<BabyBear>::default();
-        let gpu_dft = MetalBabyBearDft::default().with_min_log_n(14);
-
-        for log_n in 2..=18 {
-            let n = 1usize << log_n;
-            for &ef_width in &[4, 16] {
-                let values: Vec<EF> = (0..n * ef_width).map(|_| rng.random()).collect();
-                let cpu_result = cpu_dft.dft_algebra_batch(
-                    RowMajorMatrix::new(values.clone(), ef_width),
-                );
-                let gpu_result = gpu_dft.dft_algebra_batch(
-                    RowMajorMatrix::new(values, ef_width),
-                );
-                assert_eq!(
-                    cpu_result.values, gpu_result.values,
-                    "algebra_batch mismatch at log_n={log_n}, ef_width={ef_width}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn gpu_mmcs_matches_cpu_mmcs() {
-        use p3_baby_bear::Poseidon2BabyBear;
-        use p3_commit::Mmcs;
-        use p3_merkle_tree::MerkleTreeMmcs;
-        use p3_symmetric::{PaddingFreeSponge, TruncatedPermutation};
-
-        type Perm = Poseidon2BabyBear<16>;
-        type MyHash = PaddingFreeSponge<Perm, 16, 8, 8>;
-        type MyCompress = TruncatedPermutation<Perm, 2, 8, 16>;
-        type PackedF = <BabyBear as p3_field::Field>::Packing;
-        type CpuMmcs = MerkleTreeMmcs<PackedF, PackedF, MyHash, MyCompress, 2, 8>;
-
-        let mut rng = SmallRng::seed_from_u64(1);
-        let perm = Perm::new_from_rng_128(&mut rng);
-        let hash = MyHash::new(perm.clone());
-        let compress = MyCompress::new(perm);
-        let cpu_mmcs = CpuMmcs::new(hash, compress, 0);
-
-        let gpu = MetalBabyBearDft::default();
-        let gpu_mmcs = GpuMmcs::new(cpu_mmcs.clone(), gpu);
-
-        let mut data_rng = SmallRng::seed_from_u64(42);
-
-        for (height, width) in [(64, 16), (128, 8), (256, 32)] {
-            let data: Vec<BabyBear> = (0..height * width)
-                .map(|_| data_rng.random())
-                .collect();
-
-            let (cpu_cap, cpu_data) =
-                cpu_mmcs.commit_matrix(RowMajorMatrix::new(data.clone(), width));
-            let (gpu_cap, gpu_data) =
-                gpu_mmcs.commit_matrix(RowMajorMatrix::new(data.clone(), width));
-
-            assert_eq!(
-                cpu_cap, gpu_cap,
-                "Cap mismatch for {height}x{width}"
-            );
-
-            for idx in [0, 1, height / 2, height - 1] {
-                let cpu_opening = cpu_mmcs.open_batch(idx, &cpu_data);
-                let gpu_opening = gpu_mmcs.open_batch(idx, &gpu_data);
-                assert_eq!(
-                    cpu_opening.opened_values, gpu_opening.opened_values,
-                    "Opened values mismatch at idx={idx} for {height}x{width}"
-                );
-                assert_eq!(
-                    cpu_opening.opening_proof, gpu_opening.opening_proof,
-                    "Proof mismatch at idx={idx} for {height}x{width}"
-                );
-            }
-            eprintln!("GPU MMCS matches CPU for {height}x{width}");
-        }
-    }
-}

@@ -9,6 +9,12 @@
 pub mod gpu_dft;
 
 #[cfg(all(feature = "gpu-metal", any(target_os = "macos", target_os = "ios")))]
+pub mod gpu_koala_dft;
+
+#[cfg(all(feature = "gpu-metal", any(target_os = "macos", target_os = "ios")))]
 pub use gpu_dft::{
     DftCommitFusion, GpuChallenger, GpuKeccakMmcs, GpuMmcs, MetalBabyBearDft,
 };
+
+#[cfg(all(feature = "gpu-metal", any(target_os = "macos", target_os = "ios")))]
+pub use gpu_koala_dft::{GpuKoalaKeccakMmcs, GpuKoalaMmcs, MetalKoalaBearDft};

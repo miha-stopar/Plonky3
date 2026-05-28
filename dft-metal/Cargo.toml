@@ -20,6 +20,7 @@ objc = { version = "0.2", optional = true }
 
 [dependencies]
 p3-baby-bear.workspace = true
+p3-koala-bear.workspace = true
 p3-challenger.workspace = true
 p3-commit.workspace = true
 p3-dft.workspace = true

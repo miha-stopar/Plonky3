@@ -62,6 +62,16 @@ name = "whir_pcs_gpu"
 harness = false
 required-features = ["gpu-metal"]
 
+[[bench]]
+name = "whir_grid_gpu"
+harness = false
+required-features = ["gpu-metal"]
+
+[[bench]]
+name = "whir_ethresearch_gpu"
+harness = false
+required-features = ["gpu-metal"]
+
 [[example]]
 name = "whir"
 required-features = []
