@@ -1,6 +1,6 @@
 [package]
-name = "p3-dft-metal"
-description = "GPU-accelerated BabyBear NTT and fused DFT+Merkle for WHIR (Apple Metal)"
+name = "p3-whir-metal"
+description = "Metal backend for WHIR proving: NTT, Merkle, fused commit, PoW grind (Apple Metal)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

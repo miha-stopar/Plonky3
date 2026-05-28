@@ -172,7 +172,7 @@ where
     F: TwoAdicField + Ord,
     EF: ExtensionField<F> + TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
-    MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+    MT: Mmcs<F> + p3_whir_metal::DftCommitFusion<F>,
     Challenger: FieldChallenger<F>
         + GrindingChallenger<Witness = F>
         + CanSampleUniformBits<F>

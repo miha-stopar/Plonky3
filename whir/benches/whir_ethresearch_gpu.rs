@@ -17,7 +17,7 @@ use p3_baby_bear::{BabyBear, Poseidon2BabyBear};
 use p3_challenger::DuplexChallenger;
 use p3_commit::MultilinearPcs;
 use p3_dft::Radix2DFTSmallBatch;
-use p3_dft_metal::{GpuChallenger, GpuMmcs, MetalBabyBearDft};
+use p3_whir_metal::{GpuChallenger, GpuMmcs, MetalBabyBearDft};
 use p3_field::Field;
 use p3_field::extension::BinomialExtensionField;
 use p3_merkle_tree::MerkleTreeMmcs;

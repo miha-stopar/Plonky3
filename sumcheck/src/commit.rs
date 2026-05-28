@@ -81,7 +81,7 @@ pub fn commit_base_fused<F, Dft, MT, Challenger>(
 where
     F: TwoAdicField,
     Dft: TwoAdicSubgroupDft<F>,
-    MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+    MT: Mmcs<F> + p3_whir_metal::DftCommitFusion<F>,
     Challenger: CanObserve<MT::Commitment>,
 {
     let num_variables = poly.num_variables();

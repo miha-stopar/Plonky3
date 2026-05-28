@@ -112,7 +112,7 @@ impl<F: TwoAdicField, EF: ExtensionField<F>> Layout<F, EF> for PrefixProver<F, E
     ) -> (Self, MT::Commitment, MT::ProverData<DenseMatrix<F>>)
     where
         Dft: TwoAdicSubgroupDft<F>,
-        MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+        MT: Mmcs<F> + p3_whir_metal::DftCommitFusion<F>,
         Challenger: CanObserve<MT::Commitment>,
     {
         let (root, prover_data) = commit_base_fused(

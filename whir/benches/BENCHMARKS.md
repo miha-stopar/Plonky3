@@ -2,7 +2,7 @@
 
 Results below were measured on **Apple M1** with release builds using **thin LTO**, **`codegen-units = 1`**, and **`target-cpu=native`** (see workspace `Cargo.toml` and `.cargo/config.toml`).
 
-Ported GPU code lives in [`p3-dft-metal`](../dft-metal/); see the [ethresear.ch write-up](https://ethresear.ch/t/gpu-accelerated-whir-proving-on-apple-silicon/24762) for architecture context (based on [whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal)).
+Ported GPU code lives in [`p3-whir-metal`](../whir-metal/); see the [ethresear.ch write-up](https://ethresear.ch/t/gpu-accelerated-whir-proving-on-apple-silicon/24762) for architecture context (based on [whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal)).
 
 ## What is being timed
 
@@ -200,5 +200,5 @@ Koala **prove-only** can look faster than BabyBear at large `n` because the CPU 
 
 1. **Not comparable ms-for-ms with the post** without running `whir-p3-metal`’s `bench.sh` on the same machine.
 2. **Thermal / background load** — medians of 3 runs; long grids take hours.
-3. **`gpu_grind`** only helps when derived PoW difficulty is large enough (see `GpuChallenger` in `dft-metal/src/gpu_dft.rs`).
+3. **`gpu_grind`** only helps when derived PoW difficulty is large enough (see `GpuChallenger` in `whir-metal/src/gpu_dft.rs`).
 4. Re-run after toolchain or protocol changes; pin commit hash when publishing numbers.

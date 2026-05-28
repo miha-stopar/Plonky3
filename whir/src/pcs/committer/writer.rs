@@ -79,7 +79,7 @@ where
     F: TwoAdicField,
     EF: ExtensionField<F> + TwoAdicField + p3_field::BasedVectorSpace<F> + Clone + Send + Sync,
     Dft: TwoAdicSubgroupDft<F>,
-    MT: p3_commit::Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+    MT: p3_commit::Mmcs<F> + p3_whir_metal::DftCommitFusion<F>,
 {
     let num_variables = poly.num_variables();
     let in_cols = 1 << (num_variables - folding);

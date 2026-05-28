@@ -1,8 +1,8 @@
-# p3-dft-metal
+# p3-whir-metal
 
 GPU acceleration for WHIR on Apple Silicon (Metal): **NTT**, **Poseidon2/Keccak Merkle**, **fused commit pipelines**, and **PoW grinding** for BabyBear and KoalaBear.
 
-> **Naming:** the crate and shader files (`*_ntt.metal`) are historical — they are not DFT-only. See [INTEGRATION.md](INTEGRATION.md) for architecture, code links, and WHIR wiring.
+See [INTEGRATION.md](INTEGRATION.md) for architecture, code links, and WHIR wiring.
 
 Ported from [whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal); see also the [ethresear.ch write-up](https://ethresear.ch/t/gpu-accelerated-whir-proving-on-apple-silicon/24762).
 
@@ -22,7 +22,7 @@ p3-whir = { path = "whir", features = ["gpu-metal"] }
 ```
 
 ```rust
-use p3_dft_metal::{GpuMmcs, GpuKoalaMmcs, MetalBabyBearDft, MetalKoalaBearDft, DftCommitFusion};
+use p3_whir_metal::{GpuMmcs, GpuKoalaMmcs, MetalBabyBearDft, MetalKoalaBearDft, DftCommitFusion};
 // WhirProver::commit_fused / open_fused / prove_fused
 ```
 
@@ -52,5 +52,5 @@ cargo build -p p3-whir --bench whir_ethresearch_gpu --features gpu-metal --relea
 
 One `.metal` file per field (all kernels for that field live in one translation unit):
 
-- `shaders/babybear_ntt.metal` — field arithmetic, NTT, transpose/pad, Poseidon2 Merkle, Keccak Merkle, PoW grind
-- `shaders/koalabear_ntt.metal` — KoalaBear equivalents (different modulus + Poseidon internal layer)
+- `shaders/babybear_whir.metal` — field arithmetic, NTT, transpose/pad, Poseidon2 Merkle, Keccak Merkle, PoW grind
+- `shaders/koalabear_whir.metal` — KoalaBear equivalents (different modulus + Poseidon internal layer)

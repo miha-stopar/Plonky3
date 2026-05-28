@@ -380,7 +380,7 @@ where
     EF: ExtensionField<F> + TwoAdicField + p3_field::BasedVectorSpace<F> + Clone + Send + Sync,
     Dft: TwoAdicSubgroupDft<F>,
     Challenger: FieldChallenger<F> + GrindingChallenger<Witness = F> + CanSampleUniformBits<F>,
-    MT: Mmcs<F> + p3_dft_metal::DftCommitFusion<F>,
+    MT: Mmcs<F> + p3_whir_metal::DftCommitFusion<F>,
     L: Layout<F, EF>,
 {
     /// Like [`Self::prove`], but uses fused GPU DFT+Merkle commits each round when supported.

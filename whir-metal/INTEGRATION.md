@@ -1,6 +1,6 @@
 # GPU WHIR integration (Plonky3)
 
-How Metal acceleration connects to WHIR proving. The crate is named **`p3-dft-metal`** for historical reasons (NTT came first); shaders live in `shaders/*_ntt.metal` but also contain **Poseidon2, Keccak, transpose, and PoW** kernels — see [Shader layout](#shader-layout) below.
+How Metal acceleration connects to WHIR proving in crate **`p3-whir-metal`**. Each field has one Metal source file (`shaders/*_whir.metal`) with **NTT, Poseidon2, Keccak, transpose, and PoW** kernels — see [Shader layout](#shader-layout).
 
 Upstream reference: [whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal), [ethresear.ch write-up](https://ethresear.ch/t/gpu-accelerated-whir-proving-on-apple-silicon/24762).
 
@@ -8,7 +8,7 @@ Upstream reference: [whir-p3-metal](https://github.com/miha-stopar/whir-p3-metal
 
 ```text
 p3-whir/gpu-metal
-    ├── p3-dft-metal/gpu-metal     (Metal kernels + GpuMmcs + GpuChallenger)
+    ├── p3-whir-metal/gpu-metal     (Metal kernels + GpuMmcs + GpuChallenger)
     └── p3-sumcheck/gpu-metal      (commit_base_fused → DftCommitFusion)
 ```
 
@@ -18,7 +18,7 @@ Enable:
 p3-whir = { features = ["gpu-metal"] }
 ```
 
-## Public surface (`p3-dft-metal`)
+## Public surface (`p3-whir-metal`)
 
 | Type | Role |
 |------|------|
@@ -37,8 +37,8 @@ Exports: [`src/lib.rs`](src/lib.rs).
 
 | Layer | Link |
 |-------|------|
-| MSL kernels | [`shaders/babybear_ntt.metal`](shaders/babybear_ntt.metal) — `bb_dif_r*`, `bb_ntt_*`, `bb_ntt_stockham`, bit-reversal, shared-memory butterflies |
-| Koala MSL | [`shaders/koalabear_ntt.metal`](shaders/koalabear_ntt.metal) — `kb_*` equivalents |
+| MSL kernels | [`shaders/babybear_whir.metal`](shaders/babybear_whir.metal) — `bb_dif_r*`, `bb_ntt_*`, `bb_ntt_stockham`, bit-reversal, shared-memory butterflies |
+| Koala MSL | [`shaders/koalabear_whir.metal`](shaders/koalabear_whir.metal) — `kb_*` equivalents |
 | Rust dispatch | [`MetalBabyBearDft`](src/gpu_dft.rs) (`impl TwoAdicSubgroupDft`), pipeline table in `MetalInner` |
 | Fused encode | [`transpose_pad_dft_and_commit`](src/gpu_dft.rs) on [`DftCommitFusion`](src/gpu_dft.rs) |
 
@@ -46,7 +46,7 @@ Exports: [`src/lib.rs`](src/lib.rs).
 
 | Layer | Link |
 |-------|------|
-| MSL | `poseidon2_hash_leaves`, `poseidon2_merkle_compress`, `poseidon2_hash_and_compress`, `poseidon2_hash4_compress3`, `poseidon2_merkle_simd` in [`babybear_ntt.metal`](shaders/babybear_ntt.metal) |
+| MSL | `poseidon2_hash_leaves`, `poseidon2_merkle_compress`, `poseidon2_hash_and_compress`, `poseidon2_hash4_compress3`, `poseidon2_merkle_simd` in [`babybear_whir.metal`](shaders/babybear_whir.metal) |
 | Rust | [`GpuMmcs`](src/gpu_dft.rs) — `commit_matrix` / fused paths; [`build_poseidon2_constants`](src/gpu_dft.rs) |
 | GPU-backed tree | [`merkle-tree/src/merkle_tree.rs`](../merkle-tree/src/merkle_tree.rs) — `from_parts_gpu_backed`, `from_parts_gpu_backed_with_leaves` |
 
@@ -54,7 +54,7 @@ Exports: [`src/lib.rs`](src/lib.rs).
 
 | Layer | Link |
 |-------|------|
-| MSL | `keccak_hash_*`, `keccak_merkle_compress*` in [`babybear_ntt.metal`](shaders/babybear_ntt.metal) |
+| MSL | `keccak_hash_*`, `keccak_merkle_compress*` in [`babybear_whir.metal`](shaders/babybear_whir.metal) |
 | Rust | [`GpuKeccakMmcs`](src/gpu_dft.rs) |
 
 ### Transpose / pad (prefix layout)
@@ -68,7 +68,7 @@ Exports: [`src/lib.rs`](src/lib.rs).
 
 | Layer | Link |
 |-------|------|
-| MSL | `poseidon2_pow_grind` in [`babybear_ntt.metal`](shaders/babybear_ntt.metal) |
+| MSL | `poseidon2_pow_grind` in [`babybear_whir.metal`](shaders/babybear_whir.metal) |
 | Rust | [`GpuChallenger::grind`](src/gpu_dft.rs) — races CPU rayon grind vs GPU; used when bench mode is `gpu_grind` |
 
 ### Constraint combine (optional GPU)
@@ -121,7 +121,7 @@ Key call sites:
 
 ### 3. Fused + GPU grind (`GpuChallenger`)
 
-Same as fused, but the prover uses [`GpuChallenger`](../dft-metal/src/gpu_dft.rs) instead of `DuplexChallenger` so Fiat–Shamir PoW can use the GPU kernel when difficulty is high enough.
+Same as fused, but the prover uses [`GpuChallenger`](../whir-metal/src/gpu_dft.rs) instead of `DuplexChallenger` so Fiat–Shamir PoW can use the GPU kernel when difficulty is high enough.
 
 Bench: [`whir/benches/whir_ethresearch_gpu.rs`](../whir/benches/whir_ethresearch_gpu.rs).
 
@@ -138,14 +138,10 @@ There is **one Metal source file per field**, not one file per algorithm:
 
 | File | Contents |
 |------|----------|
-| [`shaders/babybear_ntt.metal`](shaders/babybear_ntt.metal) | Montgomery field ops, **all NTT kernels**, transpose/pad, **Poseidon2 Merkle**, **Keccak Merkle**, **PoW grind**, combine_select |
-| [`shaders/koalabear_ntt.metal`](shaders/koalabear_ntt.metal) | KoalaBear equivalents (`kb_*`, Koala Poseidon internal layer) |
+| [`shaders/babybear_whir.metal`](shaders/babybear_whir.metal) | Montgomery field ops, **all NTT kernels**, transpose/pad, **Poseidon2 Merkle**, **Keccak Merkle**, **PoW grind**, combine_select |
+| [`shaders/koalabear_whir.metal`](shaders/koalabear_whir.metal) | KoalaBear equivalents (`kb_*`, Koala Poseidon internal layer) |
 
-Loaded via `include_str!` in [`gpu_dft.rs`](src/gpu_dft.rs) / [`gpu_koala_dft.rs`](src/gpu_koala_dft.rs). A rename to e.g. `babybear_whir.metal` would be clearer but touches pipeline symbol names and downstream forks.
-
-## Crate naming
-
-`p3-dft-metal` reflects the first shipped piece (GPU NTT). The crate is the **Metal backend for WHIR commitments** (NTT + Merkle + fusion + grind). Renaming to something like `p3-whir-metal` would better match scope but is a workspace-wide rename (`Cargo.toml`, `p3-whir`, `p3-sumcheck`, docs, CI).
+Loaded via `include_str!` in [`gpu_dft.rs`](src/gpu_dft.rs) / [`gpu_koala_dft.rs`](src/gpu_koala_dft.rs).
 
 ## Examples and benches
 
